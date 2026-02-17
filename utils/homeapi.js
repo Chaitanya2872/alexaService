@@ -21,8 +21,36 @@ function homeClient(bearerToken) {
 }
 
 /**
+ * Parse the auth.token value from set-cookie headers returned by the home API.
+ * The home API sets an httpOnly cookie named "auth.token".
+ *
+ * @param {string|string[]} setCookieHeader - Raw Set-Cookie header(s)
+ * @returns {string|null} The extracted token or null
+ */
+function parseAuthTokenFromCookies(setCookieHeader) {
+  if (!setCookieHeader) return null;
+
+  const cookies = Array.isArray(setCookieHeader) ? setCookieHeader : [setCookieHeader];
+
+  for (const cookie of cookies) {
+    // Match auth.token=<value> or auth%2Etoken=<value>
+    const match = cookie.match(/auth(?:\.| %2E)token=([^;]+)/i);
+    if (match) return decodeURIComponent(match[1]);
+
+    // Some APIs return just "token=<value>"
+    const tokenMatch = cookie.match(/token=([^;]+)/i);
+    if (tokenMatch) return decodeURIComponent(tokenMatch[1]);
+  }
+
+  return null;
+}
+
+/**
  * Authenticate the user against the home API using email + password.
- * Returns { token, account } on success, throws on failure.
+ * Returns { message, data, token } on success, throws on failure.
+ *
+ * The home API returns account data in the body and sets an httpOnly cookie
+ * named "auth.token". We extract both.
  *
  * Endpoint: POST /auth/identity/strategy/basic/signin
  */
@@ -30,9 +58,25 @@ async function loginToHomeApi(email, password) {
   const resp = await axios.post(
     `${homeApiBaseUrl}/auth/identity/strategy/basic/signin`,
     { email, password },
-    { headers: { 'Content-Type': 'application/json' } }
+    {
+      headers: { 'Content-Type': 'application/json' },
+      // Prevent axios from following redirects so we can read set-cookie
+      maxRedirects: 0,
+      validateStatus: (status) => status < 400,
+    }
   );
-  return resp.data; // { message, data: { id, email, name, projectId, ... } }
+
+  // Try to extract the bearer token from set-cookie headers
+  const token = parseAuthTokenFromCookies(resp.headers['set-cookie']);
+
+  // Some API implementations may also return the token in the JSON body
+  const bodyToken = resp.data?.token || resp.data?.accessToken || null;
+
+  return {
+    message: resp.data.message,
+    data: resp.data.data,              // { id, email, name, projectId, activeProjectId, ... }
+    token: token || bodyToken || null,  // The bearer token for subsequent API calls
+  };
 }
 
 /**
@@ -44,7 +88,7 @@ async function loginToHomeApi(email, password) {
 async function listDevices(bearerToken, filters = {}) {
   const client = homeClient(bearerToken);
   const resp = await client.post('/api/server/read/spaces', filters);
-  return resp.data; // { status, data: { spaces, floors, rooms, devices, switches, scenes } }
+  return resp.data; // { status, message, data: { project, spaces, floors, rooms, devices, switches, scenes } }
 }
 
 /**
@@ -78,4 +122,10 @@ async function setActiveProject(bearerToken, accountId, projectId) {
   return resp.data;
 }
 
-module.exports = { loginToHomeApi, listDevices, controlDevice, setActiveProject };
+module.exports = {
+  loginToHomeApi,
+  listDevices,
+  controlDevice,
+  setActiveProject,
+  parseAuthTokenFromCookies,
+};
