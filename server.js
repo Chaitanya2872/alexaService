@@ -10,7 +10,7 @@ const { v4: uuidv4 } = require('uuid');
 const querystring = require('querystring');
 const axios = require('axios');
 
-const homeApi = require('./utils/Homeapi');
+const homeApi = require('./utils/homeapi');
 const { jwtSecret, accessTokenTTL, refreshTokenTTL, homeApiBaseUrl } = require('./config/secrets');
 
 const app = express();
