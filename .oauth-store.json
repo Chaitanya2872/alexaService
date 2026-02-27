@@ -1,0 +1,29 @@
+{
+  "refreshTokens": {
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJkNDNkMTQ2Yi0xMGQ0LTQ5NjUtYjVhOS00NGUxYTYyMDc5NzciLCJzY29wZSI6InByb2ZpbGU6dXNlcl9pZCBhbGV4YTo6cm91dGluZXM6dHJpZ2dlcmluc3RhbmNlczp3cml0ZSBhbGV4YTo6YXNrOnNraWxsczpyZWFkd3JpdGUgYWxleGE6OmRldmljZXM6YWxsOnJlYWQiLCJjbGllbnRfaWQiOiJhbGV4YS1za2lsbCIsInRva2VuX3VzZSI6InJlZnJlc2giLCJpYXQiOjE3NzIxMjQwOTcsImV4cCI6MTc3NDcxNjA5N30.ApgQoqca8OlDWKFhFX1YbZi3-eKekgPERXmrZhGvgaE": {
+      "userId": "d43d146b-10d4-4965-b5a9-44e1a6207977",
+      "clientId": "alexa-skill",
+      "scope": "profile:user_id alexa::routines:triggerinstances:write alexa::ask:skills:readwrite alexa::devices:all:read",
+      "expiresAt": 1774716097413,
+      "homeApiToken": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6ImQ0M2QxNDZiLTEwZDQtNDk2NS1iNWE5LTQ0ZTFhNjIwNzk3NyIsImlhdCI6MTc3MjEyNDA4OSwiaXNzIjoiUFNNIiwiZXhwIjoxNzcyNzI4ODg5fQ.HhyybO8zn83g-Z9lUH6eLv0o1d4L1A8mAAvo1bKBK0A",
+      "accountId": "d43d146b-10d4-4965-b5a9-44e1a6207977",
+      "projectId": "ff0d259f-c4f4-472d-845f-9ca416d6b919"
+    },
+    "84f084bc-2ce0-46f0-93cf-a9b414a512dc": {
+      "userId": "d43d146b-10d4-4965-b5a9-44e1a6207977",
+      "clientId": "alexa-skill",
+      "scope": "profile:user_id alexa::routines:triggerinstances:write alexa::ask:skills:readwrite alexa::devices:all:read",
+      "expiresAt": 1774721938002,
+      "homeApiToken": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6ImQ0M2QxNDZiLTEwZDQtNDk2NS1iNWE5LTQ0ZTFhNjIwNzk3NyIsImlhdCI6MTc3MjEyOTkzMywiaXNzIjoiUFNNIiwiZXhwIjoxNzcyNzM0NzMzfQ.LJC01lxf7sZeVB1vyblTWkcaj6CcwEFBwQz2Y3oTyY8",
+      "accountId": "d43d146b-10d4-4965-b5a9-44e1a6207977",
+      "projectId": "ff0d259f-c4f4-472d-845f-9ca416d6b919"
+    }
+  },
+  "homeTokenStore": {
+    "d43d146b-10d4-4965-b5a9-44e1a6207977": {
+      "homeApiToken": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6ImQ0M2QxNDZiLTEwZDQtNDk2NS1iNWE5LTQ0ZTFhNjIwNzk3NyIsImlhdCI6MTc3MjEyOTkzMywiaXNzIjoiUFNNIiwiZXhwIjoxNzcyNzM0NzMzfQ.LJC01lxf7sZeVB1vyblTWkcaj6CcwEFBwQz2Y3oTyY8",
+      "accountId": "d43d146b-10d4-4965-b5a9-44e1a6207977",
+      "projectId": "ff0d259f-c4f4-472d-845f-9ca416d6b919"
+    }
+  }
+}

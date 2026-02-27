@@ -1,21 +1,33 @@
-// server.js - Complete OAuth Provider + Alexa Smart Home Skill Backend for IOtiq Connect
-// Replaces AWS Lambda — handles OAuth account linking, device discovery, and device control
-// by proxying to the IOtiq Connect home-automation API.
+// server.js - IOtiq Connect ↔ Alexa Smart Home Integration Server
+// Architecture: Alexa → Lambda proxy → this server → IOtiq Connect REST APIs
+//
+// KEY INSIGHT about the IOtiq data model:
+//   "devices"   = dongles, IR blasters (hardware hubs) — NOT controllable, skip
+//   "switches"  = physical device controllers (e.g. "Elevate 4 Switch Controller") — parent devices
+//   "Components" inside each switch = the ACTUAL controllable endpoints (L1, L2, Fan, AC etc.)
+//   "scenes"    = automation scenes — expose as SCENE_TRIGGER
+//
+// For the trigger API:
+//   deviceId  = the SWITCH (parent device) UUID
+//   utterence = "control switch"
+//   params    = { status: "on"/"off", switch_no: "S1" }  (from component metadata)
+
+require('dotenv').config();
 
 const express = require('express');
 const bodyParser = require('body-parser');
 const cookieParser = require('cookie-parser');
 const jwt = require('jsonwebtoken');
+const fs = require('fs');
+const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const querystring = require('querystring');
-const axios = require('axios');
 
 const homeApi = require('./utils/homeapi');
-const { jwtSecret, accessTokenTTL, refreshTokenTTL, homeApiBaseUrl } = require('./config/secrets');
+const { jwtSecret, accessTokenTTL, homeApiBaseUrl } = require('./config/secrets');
 
 const app = express();
 
-// ─── Middleware ────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -28,243 +40,313 @@ app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 app.use(cookieParser());
 
-// ─── Config ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = jwtSecret;
 const CODE_TTL_SEC = 600;
 const ACCESS_TOKEN_TTL_SEC = accessTokenTTL || 3600;
 
-// ─── Registered OAuth Clients ─────────────────────────────────────────────────
+// ─── OAuth Clients ────────────────────────────────────────────────────────────
+const ALEXA_CLIENT_ID = process.env.ALEXA_CLIENT_ID || 'alexa-skill';
+const ALEXA_CLIENT_SECRET = process.env.ALEXA_CLIENT_SECRET || 'alexa-client-secret';
+const ALEXA_SKILL_ID = process.env.ALEXA_SKILL_ID || 'M8UOFD7R8R1TG';
+const ALEXA_REDIRECT_HOSTS = new Set([
+  'pitangui.amazon.com',
+  'layla.amazon.com',
+  'alexa.amazon.co.jp',
+  'skills-store.amazon.com',
+]);
+
+function parseCsvEnv(value) {
+  if (!value) return [];
+  return value
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function buildDefaultAlexaRedirectUris(skillId) {
+  if (!skillId) return [];
+  return [
+    `https://pitangui.amazon.com/api/skill/link/${skillId}`,
+    `https://layla.amazon.com/api/skill/link/${skillId}`,
+    `https://alexa.amazon.co.jp/api/skill/link/${skillId}`,
+    `https://skills-store.amazon.com/api/skill/link/${skillId}`,
+  ];
+}
+
+function isAlexaRedirectUri(urlValue) {
+  try {
+    const parsed = new URL(urlValue);
+    return (
+      ALEXA_REDIRECT_HOSTS.has(parsed.host) &&
+      /^\/api\/skill\/link\/[A-Za-z0-9]+$/.test(parsed.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+const configuredRedirectUris = Array.from(new Set([
+  ...parseCsvEnv(process.env.ALEXA_REDIRECT_URIS),
+  ...(process.env.ALEXA_REDIRECT_URI ? [process.env.ALEXA_REDIRECT_URI] : []),
+  ...buildDefaultAlexaRedirectUris(ALEXA_SKILL_ID),
+]));
+
 const clients = {
-  'alexa-skill': {
-    clientSecret: 'alexa-client-secret',
-    redirectUris: [
-      'https://pitangui.amazon.com/api/skill/link/M8UOFD7R8R1TG',
-      'https://layla.amazon.com/api/skill/link/M8UOFD7R8R1TG',
-      'https://alexa.amazon.co.jp/api/skill/link/M8UOFD7R8R1TG',
-      'https://skills-store.amazon.com/api/skill/link/M8UOFD7R8R1TG',
-    ],
+  [ALEXA_CLIENT_ID]: {
+    clientSecret: ALEXA_CLIENT_SECRET,
+    redirectUris: configuredRedirectUris,
   },
 };
 
-// ─── In-Memory Stores (replace with DB in production) ─────────────────────────
-const authCodes = {};       // code -> { clientId, redirectUri, userId, expiresAt, scope, homeApiToken, accountId, projectId }
-const refreshTokens = {};   // refreshToken -> { userId, clientId, scope, expiresAt, homeApiToken, accountId, projectId }
-const homeTokenStore = {};  // userId -> { homeApiToken, accountId, projectId, email, name }
+// ─── In-Memory Stores ─────────────────────────────────────────────────────────
+const authCodes = {};
+const refreshTokens = {};
+const homeTokenStore = {};
+const OAUTH_STORE_PATH = path.join(__dirname, '.oauth-store.json');
 
-// ─── Helper: Store home-API credentials after account linking ─────────────────
+function persistOAuthStore() {
+  const data = {
+    refreshTokens,
+    homeTokenStore,
+  };
+  try {
+    fs.writeFileSync(OAUTH_STORE_PATH, JSON.stringify(data, null, 2));
+  } catch (err) {
+    console.error(`[oauth-store] Failed to persist store: ${err.message}`);
+  }
+}
+
+function loadOAuthStore() {
+  try {
+    if (!fs.existsSync(OAUTH_STORE_PATH)) return;
+    const raw = fs.readFileSync(OAUTH_STORE_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+
+    for (const key of Object.keys(refreshTokens)) delete refreshTokens[key];
+    for (const key of Object.keys(homeTokenStore)) delete homeTokenStore[key];
+
+    if (parsed?.refreshTokens && typeof parsed.refreshTokens === 'object') {
+      Object.assign(refreshTokens, parsed.refreshTokens);
+    }
+    if (parsed?.homeTokenStore && typeof parsed.homeTokenStore === 'object') {
+      Object.assign(homeTokenStore, parsed.homeTokenStore);
+    }
+
+    console.log(`[oauth-store] Loaded refreshTokens=${Object.keys(refreshTokens).length}, users=${Object.keys(homeTokenStore).length}`);
+  } catch (err) {
+    console.error(`[oauth-store] Failed to load store: ${err.message}`);
+  }
+}
+
+function upsertRefreshToken(token, value) {
+  refreshTokens[token] = value;
+  persistOAuthStore();
+}
+
+function removeRefreshToken(token) {
+  if (!refreshTokens[token]) return;
+  delete refreshTokens[token];
+  persistOAuthStore();
+}
+
 function storeHomeToken(userId, { homeApiToken, accountId, projectId, email, name }) {
   homeTokenStore[userId] = { homeApiToken, accountId, projectId, email, name };
-  console.log(`[homeTokenStore] Stored token for user ${userId} (account: ${accountId}, project: ${projectId})`);
+  console.log(`[store] Token stored for ${userId} (project: ${projectId})`);
+  persistOAuthStore();
+}
+function getHomeToken(userId) { return homeTokenStore[userId] || null; }
+
+function recoverHomeTokenFromRefresh(userId) {
+  for (const tokenData of Object.values(refreshTokens)) {
+    if (tokenData?.userId !== userId || !tokenData?.homeApiToken) continue;
+
+    const recovered = {
+      homeApiToken: tokenData.homeApiToken,
+      accountId: tokenData.accountId,
+      projectId: tokenData.projectId,
+    };
+    homeTokenStore[userId] = recovered;
+    console.log(`[store] Recovered token for ${userId} from refresh token store`);
+    persistOAuthStore();
+    return recovered;
+  }
+  return null;
 }
 
-// ─── Helper: Retrieve home-API credentials for a user ─────────────────────────
-function getHomeToken(userId) {
-  return homeTokenStore[userId] || null;
-}
+loadOAuthStore();
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  LOGIN PAGE (shown during Alexa account linking)
+//  DEVICE CACHE + COMPONENT MAP
+// ═══════════════════════════════════════════════════════════════════════════════
+const deviceCache = {};
+const CACHE_TTL_MS = 30_000;
+const inflightRequests = {};
+
+// Maps componentId -> { parentSwitchId, switchNo, componentType, ... }
+// Built during discovery so control commands can look up the parent device
+const componentMap = {};
+
+async function getCachedDevices(userId, homeApiToken, projectId) {
+  const now = Date.now();
+  const cached = deviceCache[userId];
+  if (cached && now < cached.expiresAt) return cached.data;
+  if (inflightRequests[userId]) return inflightRequests[userId];
+
+  inflightRequests[userId] = homeApi.listDevices(homeApiToken, {}, projectId)
+    .then((result) => {
+      deviceCache[userId] = { data: result, expiresAt: now + CACHE_TTL_MS };
+      delete inflightRequests[userId];
+      // Build component map
+      buildComponentMap(result.data);
+      return result;
+    })
+    .catch((err) => { delete inflightRequests[userId]; throw err; });
+
+  return inflightRequests[userId];
+}
+
+function invalidateCache(userId) { delete deviceCache[userId]; }
+
+/**
+ * Build a lookup from componentId -> parent switch info.
+ * This is used during control to know which switch deviceId + switch_no to send.
+ */
+function buildComponentMap(data) {
+  if (!data) return;
+
+  // Iterate over BOTH switches AND devices (dongles)
+  const allParentDevices = {
+    ...(data.switches || {}),
+    ...(data.devices || {}),
+  };
+
+  for (const [parentId, sw] of Object.entries(allParentDevices)) {
+    const components = sw.Components || [];
+
+    // Detect device type: dongle vs switch controller
+    const connectionType = (sw.Item?.metadata?.connectionType || '').toLowerCase();
+    const itemName = (sw.Item?.name || '').toLowerCase();
+    const itemCode = (sw.Item?.itemCode || '').toLowerCase();
+    const isDongle = connectionType.includes('dongle') || itemName.includes('dongle') || itemCode.includes('dc');
+
+    for (const comp of components) {
+      // Skip components with no metadata (unconfigured slots)
+      if (!comp.metadata) continue;
+
+      componentMap[comp.id] = {
+        parentSwitchId: parentId,
+        switchNo: comp.metadata?.switch_no || `S${comp.componentNumber}`,
+        channel: comp.metadata?.channel || null,
+        componentNumber: comp.componentNumber,
+        componentType: (comp.metadata?.type || 'switch').toLowerCase(),
+        deviceName: comp.metadata?.deviceName || comp.name || null,
+        parentDeviceName: sw.deviceName || sw.Item?.name || null,
+        roomName: sw.Segments?.[0]?.name || null,
+        floorName: sw.Segments?.[0]?.ParentSegment?.name || null,
+        spaceName: sw.Space?.name || null,
+        // Control info
+        isDongle,
+        controlUtterance: isDongle ? 'control dongle' : 'control switch',
+      };
+    }
+  }
+
+  console.log(`[componentMap] Built map for ${Object.keys(componentMap).length} components`);
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LOGIN
 // ═══════════════════════════════════════════════════════════════════════════════
 app.get('/login', (req, res) => {
   const continueTo = req.query.continue || '/';
   const error = req.query.error || '';
-  const continueValue = continueTo.replace(/"/g, '&quot;');
-
   res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>IOtiq Connect — Link Account</title>
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f0f4f8; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
-        .card { background: #fff; padding: 2rem; border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,.1); width: 100%; max-width: 380px; }
-        h2 { margin-bottom: .5rem; font-size: 1.4rem; color: #1a1a2e; }
-        p  { font-size: .9rem; color: #666; margin-bottom: 1.5rem; }
-        label { display: block; font-size: .85rem; font-weight: 600; color: #333; margin-bottom: .3rem; }
-        input { width: 100%; padding: .65rem .9rem; border: 1px solid #d1d5db; border-radius: 8px; font-size: 1rem; margin-bottom: 1rem; }
-        input:focus { outline: none; border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,.15); }
-        button { width: 100%; padding: .75rem; background: #2563eb; color: #fff; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; }
-        button:hover { background: #1d4ed8; }
-        .error { color: #dc2626; font-size: .85rem; margin-bottom: 1rem; padding: .5rem; background: #fef2f2; border-radius: 6px; }
-      </style>
-    </head>
-    <body>
-      <div class="card">
-        <h2>Link Your Account</h2>
-        <p>Sign in with your IOtiq Connect credentials to link with Alexa.</p>
-        ${error ? `<div class="error">${error}</div>` : ''}
-        <form method="POST" action="/login">
-          <input type="hidden" name="continue" value="${continueValue}" />
-          <label for="email">Email</label>
-          <input type="email" id="email" name="username" placeholder="you@example.com" required />
-          <label for="password">Password</label>
-          <input type="password" id="password" name="password" placeholder="••••••••" required />
-          <button type="submit">Sign In &amp; Link</button>
-        </form>
-      </div>
-    </body>
-    </html>
+    <!DOCTYPE html><html><head><title>IOtiq Connect — Link Account</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#f0f4f8;display:flex;align-items:center;justify-content:center;min-height:100vh}.card{background:#fff;padding:2rem;border-radius:12px;box-shadow:0 4px 24px rgba(0,0,0,.1);width:100%;max-width:380px}h2{margin-bottom:.5rem;font-size:1.4rem}p{font-size:.9rem;color:#666;margin-bottom:1.5rem}label{display:block;font-size:.85rem;font-weight:600;color:#333;margin-bottom:.3rem}input{width:100%;padding:.65rem .9rem;border:1px solid #d1d5db;border-radius:8px;font-size:1rem;margin-bottom:1rem}button{width:100%;padding:.75rem;background:#2563eb;color:#fff;border:none;border-radius:8px;font-size:1rem;font-weight:600;cursor:pointer}.error{color:#dc2626;font-size:.85rem;margin-bottom:1rem;padding:.5rem;background:#fef2f2;border-radius:6px}</style>
+    </head><body><div class="card">
+    <h2>Link Your Account</h2><p>Sign in with IOtiq Connect to link with Alexa.</p>
+    ${error ? `<div class="error">${error}</div>` : ''}
+    <form method="POST" action="/login">
+      <input type="hidden" name="continue" value="${continueTo.replace(/"/g, '&quot;')}" />
+      <label>Email</label><input type="email" name="username" required />
+      <label>Password</label><input type="password" name="password" required />
+      <button type="submit">Sign In &amp; Link</button>
+    </form></div></body></html>
   `);
 });
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  POST /login — Authenticate against IOtiq Connect Home API
-// ═══════════════════════════════════════════════════════════════════════════════
 app.post('/login', async (req, res) => {
   const { username, password, continue: cont } = req.body;
-
-  console.log(`[LOGIN] Attempting login for: ${username}`);
-
-  let homeAccount = null;
-  let homeApiToken = null;
-
+  console.log(`[LOGIN] ${username}`);
   try {
-    // ── Authenticate against the IOtiq Connect Home API ──
     const result = await homeApi.loginToHomeApi(username, password);
-    homeAccount = result.data;       // { id, email, name, projectId, activeProjectId, ... }
-    homeApiToken = result.token;     // Bearer token extracted from set-cookie or body
-
-    console.log(`[LOGIN] Home API login success. Account ID: ${homeAccount.id}, Token present: ${!!homeApiToken}`);
+    const acct = result.data;
+    const token = result.token;
+    storeHomeToken(acct.id, { homeApiToken: token, accountId: acct.id, projectId: acct.projectId || acct.activeProjectId, email: acct.email, name: acct.name });
+    res.cookie('userId', acct.id, { httpOnly: true, secure: false });
+    res.redirect(cont || '/');
   } catch (err) {
-    console.error(`[LOGIN] Home API login failed: ${err.message}`);
-    const errorMsg = encodeURIComponent('Invalid email or password.');
-    return res.redirect(`/login?error=${errorMsg}&continue=${encodeURIComponent(cont || '/')}`);
+    console.error(`[LOGIN] Failed: ${err.message}`);
+    const msg = encodeURIComponent(err.responseData?.message || 'Invalid credentials');
+    res.redirect(`/login?error=${msg}&continue=${encodeURIComponent(cont || '/')}`);
   }
-
-  if (!homeAccount || !homeAccount.id) {
-    const errorMsg = encodeURIComponent('Login failed — unexpected response from server.');
-    return res.redirect(`/login?error=${errorMsg}&continue=${encodeURIComponent(cont || '/')}`);
-  }
-
-  // Store home-API credentials so we can use them for device calls later
-  const userId = homeAccount.id;
-  storeHomeToken(userId, {
-    homeApiToken,
-    accountId: homeAccount.id,
-    projectId: homeAccount.projectId || homeAccount.activeProjectId,
-    email: homeAccount.email,
-    name: homeAccount.name,
-  });
-
-  // Set session cookie (used by /authorize to know who is logged in)
-  res.cookie('userId', userId, { httpOnly: true, secure: false });
-  res.redirect(cont || '/');
 });
 
+
 // ═══════════════════════════════════════════════════════════════════════════════
-//  GET /authorize — OAuth 2.0 Authorization Endpoint (Alexa account linking)
+//  OAUTH ENDPOINTS
 // ═══════════════════════════════════════════════════════════════════════════════
 app.get('/authorize', (req, res) => {
   const { response_type, client_id, redirect_uri, state, scope } = req.query;
-
-  console.log('[AUTHORIZE] Request:', JSON.stringify(req.query, null, 2));
-
-  if (response_type !== 'code') {
-    return res.status(400).send('response_type must be "code"');
-  }
-
+  if (response_type !== 'code') return res.status(400).send('response_type must be "code"');
   const client = clients[client_id];
-  if (!client) {
-    return res.status(400).send(`Unknown client_id: ${client_id}`);
-  }
-
-  if (!client.redirectUris.includes(redirect_uri)) {
-    console.log('[AUTHORIZE] Invalid redirect_uri:', redirect_uri);
-    console.log('[AUTHORIZE] Allowed:', client.redirectUris);
+  if (!client) return res.status(400).send(`Unknown client_id`);
+  const redirectAllowed = client.redirectUris.includes(redirect_uri) || isAlexaRedirectUri(redirect_uri);
+  if (!redirectAllowed) {
+    console.error(`[AUTHORIZE] Invalid redirect_uri for client "${client_id}": ${redirect_uri}`);
+    console.error(`[AUTHORIZE] Configured redirectUris: ${client.redirectUris.join(', ')}`);
     return res.status(400).send('Invalid redirect_uri');
   }
 
-  // If user not logged in, redirect to login page
   if (!req.cookies.userId) {
-    const continueUrl = `/authorize?${querystring.stringify(req.query)}`;
-    return res.redirect(`/login?continue=${encodeURIComponent(continueUrl)}`);
+    return res.redirect(`/login?continue=${encodeURIComponent(`/authorize?${querystring.stringify(req.query)}`)}`);
   }
 
   const userId = req.cookies.userId;
   const stored = getHomeToken(userId);
-
-  // Generate authorization code — stash home-API token so /token can retrieve it
   const code = uuidv4();
-  authCodes[code] = {
-    clientId: client_id,
-    redirectUri: redirect_uri,
-    userId,
-    scope,
-    expiresAt: Date.now() + CODE_TTL_SEC * 1000,
-    // Carry through home-API credentials
-    homeApiToken: stored?.homeApiToken || null,
-    accountId: stored?.accountId || null,
-    projectId: stored?.projectId || null,
-  };
+  authCodes[code] = { clientId: client_id, redirectUri: redirect_uri, userId, scope, expiresAt: Date.now() + CODE_TTL_SEC * 1000,
+    homeApiToken: stored?.homeApiToken, accountId: stored?.accountId, projectId: stored?.projectId };
 
-  console.log(`[AUTHORIZE] Code generated for user ${userId}: ${code}`);
-
-  // Redirect back to Alexa with the authorization code
-  const redirectTo = new URL(redirect_uri);
-  redirectTo.searchParams.set('code', code);
-  if (state) redirectTo.searchParams.set('state', state);
-
-  res.redirect(redirectTo.toString());
+  console.log(`[AUTHORIZE] Code for ${userId}: ${code}`);
+  const redir = new URL(redirect_uri);
+  redir.searchParams.set('code', code);
+  if (state) redir.searchParams.set('state', state);
+  res.redirect(redir.toString());
 });
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  POST /token — OAuth 2.0 Token Endpoint
-// ═══════════════════════════════════════════════════════════════════════════════
 app.post('/token', (req, res) => {
-  console.log('[TOKEN] Request body:', JSON.stringify(req.body, null, 2));
-
-  const grant_type = req.body.grant_type;
-
-  if (!grant_type) {
-    return res.status(400).json({ error: 'invalid_request', error_description: 'grant_type is required' });
-  }
-
-  // ── Extract client credentials (Basic Auth or body) ──
+  const { grant_type } = req.body;
   let clientId, clientSecret;
-  if (req.headers.authorization && req.headers.authorization.startsWith('Basic ')) {
-    const b64 = req.headers.authorization.slice('Basic '.length);
-    const [cId, cSecret] = Buffer.from(b64, 'base64').toString().split(':');
-    clientId = cId;
-    clientSecret = cSecret;
-  } else {
-    clientId = req.body.client_id;
-    clientSecret = req.body.client_secret;
-  }
+  if (req.headers.authorization?.startsWith('Basic ')) {
+    [clientId, clientSecret] = Buffer.from(req.headers.authorization.slice(6), 'base64').toString().split(':');
+  } else { clientId = req.body.client_id; clientSecret = req.body.client_secret; }
 
   const client = clients[clientId];
-  if (!client || client.clientSecret !== clientSecret) {
-    return res.status(401).json({ error: 'invalid_client' });
-  }
+  if (!client || client.clientSecret !== clientSecret) return res.status(401).json({ error: 'invalid_client' });
 
-  // ── Grant Type: authorization_code ──────────────────────────────────────────
   if (grant_type === 'authorization_code') {
-    const { code, redirect_uri } = req.body;
-    const stored = authCodes[code];
+    const stored = authCodes[req.body.code];
+    if (!stored || stored.clientId !== clientId) return res.status(400).json({ error: 'invalid_grant' });
+    if (Date.now() > stored.expiresAt) { delete authCodes[req.body.code]; return res.status(400).json({ error: 'invalid_grant' }); }
 
-    if (!stored) {
-      return res.status(400).json({ error: 'invalid_grant', error_description: 'code not found or already used' });
-    }
-    if (stored.clientId !== clientId) {
-      return res.status(400).json({ error: 'invalid_grant', error_description: 'client mismatch' });
-    }
-    if (Date.now() > stored.expiresAt) {
-      delete authCodes[code];
-      return res.status(400).json({ error: 'invalid_grant', error_description: 'code expired' });
-    }
-
-    // Issue JWT access token — embed userId so Alexa directives can be resolved
-    const accessToken = jwt.sign(
-      { sub: stored.userId, scope: stored.scope, client_id: clientId },
-      JWT_SECRET,
-      { expiresIn: ACCESS_TOKEN_TTL_SEC }
-    );
-
-    // Issue opaque refresh token — store home-API credentials alongside it
+    const accessToken = jwt.sign({ sub: stored.userId, scope: stored.scope, client_id: clientId }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_TTL_SEC });
     const refreshToken = uuidv4();
-    refreshTokens[refreshToken] = {
+    upsertRefreshToken(refreshToken, {
       userId: stored.userId,
       clientId,
       scope: stored.scope,
@@ -272,676 +354,373 @@ app.post('/token', (req, res) => {
       homeApiToken: stored.homeApiToken,
       accountId: stored.accountId,
       projectId: stored.projectId,
-    };
-
-    // Ensure home token store is populated (in case server restarted between login and token exchange)
-    if (stored.homeApiToken) {
-      storeHomeToken(stored.userId, {
-        homeApiToken: stored.homeApiToken,
-        accountId: stored.accountId,
-        projectId: stored.projectId,
-      });
-    }
-
-    // One-time use
-    delete authCodes[code];
-
-    console.log(`[TOKEN] Tokens issued for user ${stored.userId}`);
-
-    return res.json({
-      access_token: accessToken,
-      token_type: 'Bearer',
-      expires_in: ACCESS_TOKEN_TTL_SEC,
-      refresh_token: refreshToken,
-      scope: stored.scope,
     });
+
+    if (stored.homeApiToken) storeHomeToken(stored.userId, { homeApiToken: stored.homeApiToken, accountId: stored.accountId, projectId: stored.projectId });
+    delete authCodes[req.body.code];
+
+    return res.json({ access_token: accessToken, token_type: 'Bearer', expires_in: ACCESS_TOKEN_TTL_SEC, refresh_token: refreshToken });
   }
 
-  // ── Grant Type: refresh_token ───────────────────────────────────────────────
   if (grant_type === 'refresh_token') {
-    const refreshToken = req.body.refresh_token;
-    const stored = refreshTokens[refreshToken];
-
-    if (!stored || stored.clientId !== clientId) {
+    const stored = refreshTokens[req.body.refresh_token];
+    if (!stored || stored.clientId !== clientId) return res.status(400).json({ error: 'invalid_grant' });
+    if (Date.now() > stored.expiresAt) {
+      removeRefreshToken(req.body.refresh_token);
       return res.status(400).json({ error: 'invalid_grant' });
     }
-    if (Date.now() > stored.expiresAt) {
-      delete refreshTokens[refreshToken];
-      return res.status(400).json({ error: 'invalid_grant', error_description: 'refresh token expired' });
-    }
 
-    const accessToken = jwt.sign(
-      { sub: stored.userId, scope: stored.scope, client_id: clientId },
-      JWT_SECRET,
-      { expiresIn: ACCESS_TOKEN_TTL_SEC }
-    );
-
-    // Re-ensure home token store is populated on refresh
-    if (stored.homeApiToken) {
-      storeHomeToken(stored.userId, {
-        homeApiToken: stored.homeApiToken,
-        accountId: stored.accountId,
-        projectId: stored.projectId,
-      });
-    }
-
-    console.log(`[TOKEN] Access token refreshed for user ${stored.userId}`);
-
+    const accessToken = jwt.sign({ sub: stored.userId, scope: stored.scope, client_id: clientId }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_TTL_SEC });
+    if (stored.homeApiToken) storeHomeToken(stored.userId, { homeApiToken: stored.homeApiToken, accountId: stored.accountId, projectId: stored.projectId });
     return res.json({
       access_token: accessToken,
       token_type: 'Bearer',
       expires_in: ACCESS_TOKEN_TTL_SEC,
-      scope: stored.scope,
+      refresh_token: req.body.refresh_token,
     });
   }
 
   return res.status(400).json({ error: 'unsupported_grant_type' });
 });
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  GET /userinfo — Returns linked user profile
-// ═══════════════════════════════════════════════════════════════════════════════
 app.get('/userinfo', (req, res) => {
   const auth = req.headers.authorization;
-  if (!auth || !auth.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'invalid_token' });
-  }
-
+  if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'invalid_token' });
   try {
-    const payload = jwt.verify(auth.slice('Bearer '.length), JWT_SECRET);
-    const stored = getHomeToken(payload.sub);
-
-    return res.json({
-      sub: payload.sub,
-      user_id: payload.sub,
-      email: stored?.email || null,
-      name: stored?.name || null,
-    });
-  } catch (e) {
-    return res.status(401).json({ error: 'invalid_token' });
-  }
+    const p = jwt.verify(auth.slice(7), JWT_SECRET);
+    const s = getHomeToken(p.sub);
+    return res.json({ sub: p.sub, email: s?.email, name: s?.name });
+  } catch { return res.status(401).json({ error: 'invalid_token' }); }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-//  POST /alexa/smart-home — Alexa Smart Home Skill Endpoint (replaces Lambda)
-//
-//  This single endpoint receives ALL Alexa Smart Home directives:
-//    - Alexa.Discovery          → calls IOtiq listDevices API
-//    - Alexa.PowerController    → calls IOtiq controlDevice API
-//    - Alexa.BrightnessController → calls IOtiq controlDevice API
-//    - Alexa.PowerLevelController → calls IOtiq controlDevice API
-//    - Alexa.ThermostatController → calls IOtiq controlDevice API
-//    - Alexa.Authorization      → AcceptGrant
-//    - Alexa (ReportState)      → calls IOtiq listDevices API
-//
-// ═══════════════════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ALEXA SMART HOME ENDPOINT
+// ═══════════════════════════════════════════════════════════════════════════════
 app.post('/alexa/smart-home', async (req, res) => {
   const request = req.body;
-
   try {
-    console.log('[ALEXA] Directive received:', JSON.stringify(request, null, 2));
-
     const namespace = request?.directive?.header?.namespace;
     const name = request?.directive?.header?.name;
+    console.log(`[ALEXA] ${namespace}.${name}`);
 
-    // ── AcceptGrant (no token needed) ─────────────────────────────────────────
+    // ── AcceptGrant ─────────────────────────────────────────────────────────
     if (namespace === 'Alexa.Authorization' && name === 'AcceptGrant') {
-      return res.json({
-        event: {
-          header: {
-            namespace: 'Alexa.Authorization',
-            name: 'AcceptGrant.Response',
-            payloadVersion: '3',
-            messageId: uuidv4(),
-          },
-          payload: {},
-        },
-      });
+      return res.json({ event: { header: { namespace: 'Alexa.Authorization', name: 'AcceptGrant.Response', payloadVersion: '3', messageId: uuidv4() }, payload: {} } });
     }
 
-    // ── Discovery ─────────────────────────────────────────────────────────────
+    // ── Discovery ───────────────────────────────────────────────────────────
     if (namespace === 'Alexa.Discovery' && name === 'Discover') {
       const token = request?.directive?.payload?.scope?.token;
       const { userId, stored } = resolveUser(token);
-
-      if (!stored || !stored.homeApiToken) {
-        console.error('[ALEXA] Discovery: No home-API token for user', userId);
-        return res.json(buildErrorResponse('EXPIRED_AUTHORIZATION_CREDENTIAL', 'Account not linked or token missing'));
-      }
+      if (!stored?.homeApiToken) return res.json(buildError('EXPIRED_AUTHORIZATION_CREDENTIAL', 'Not linked'));
 
       console.log(`[ALEXA] Discovery for user ${userId}`);
-
-      const spacesData = await homeApi.listDevices(stored.homeApiToken, {});
-      const endpoints = mapDevicesToAlexaEndpoints(spacesData.data);
-
+      const spacesData = await getCachedDevices(userId, stored.homeApiToken, stored.projectId);
+      const endpoints = buildAlexaEndpoints(spacesData.data);
       console.log(`[ALEXA] Discovered ${endpoints.length} endpoints`);
 
-      return res.json({
-        event: {
-          header: {
-            namespace: 'Alexa.Discovery',
-            name: 'Discover.Response',
-            payloadVersion: '3',
-            messageId: uuidv4(),
-          },
-          payload: { endpoints },
-        },
-      });
+      return res.json({ event: { header: { namespace: 'Alexa.Discovery', name: 'Discover.Response', payloadVersion: '3', messageId: uuidv4() }, payload: { endpoints } } });
     }
 
-    // ── All other directives (control, state report, etc.) ────────────────────
+    // ── All other directives ────────────────────────────────────────────────
     const token = request?.directive?.endpoint?.scope?.token;
     const endpointId = request?.directive?.endpoint?.endpointId;
     const correlationToken = request?.directive?.header?.correlationToken;
     const { userId, stored } = resolveUser(token);
+    if (!stored?.homeApiToken) return res.json(buildError('EXPIRED_AUTHORIZATION_CREDENTIAL', 'Not linked', correlationToken));
 
-    if (!stored || !stored.homeApiToken) {
-      return res.json(buildErrorResponse('EXPIRED_AUTHORIZATION_CREDENTIAL', 'Account not linked', correlationToken));
+    const { homeApiToken, projectId } = stored;
+
+    // Ensure component map is populated
+    if (Object.keys(componentMap).length === 0) {
+      await getCachedDevices(userId, homeApiToken, projectId);
     }
 
-    // ── PowerController ───────────────────────────────────────────────────────
+    // ── SceneController ─────────────────────────────────────────────────────
+    if (namespace === 'Alexa.SceneController') {
+      const utterance = name === 'Activate' ? 'turn on' : 'turn off';
+      console.log(`[ALEXA] Scene: ${utterance} ${endpointId}`);
+      try {
+        await homeApi.controlDevice(homeApiToken, endpointId, utterance, {}, projectId);
+      } catch (err) { logControlError(err); return res.json(buildError('ENDPOINT_UNREACHABLE', err.message, correlationToken)); }
+
+      return res.json({
+        context: {},
+        event: { header: { namespace: 'Alexa.SceneController', name: name === 'Activate' ? 'ActivationStarted' : 'DeactivationStarted', payloadVersion: '3', messageId: uuidv4(), correlationToken },
+          endpoint: { endpointId }, payload: { cause: { type: 'VOICE_INTERACTION' }, timestamp: new Date().toISOString() } },
+      });
+    }
+
+    // ── PowerController ─────────────────────────────────────────────────────
     if (namespace === 'Alexa.PowerController') {
-      const utterance = name === 'TurnOn' ? 'turn on' : 'turn off';
-      const value = name === 'TurnOn' ? 'ON' : 'OFF';
+      const onOff = name === 'TurnOn' ? 'on' : 'off';
+      const comp = componentMap[endpointId];
 
-      console.log(`[ALEXA] PowerController: ${utterance} on device ${endpointId}`);
-
-      try {
-        await homeApi.controlDevice(stored.homeApiToken, endpointId, utterance);
-      } catch (err) {
-        console.error(`[ALEXA] controlDevice error: ${err.message}`);
-        return res.json(buildErrorResponse('ENDPOINT_UNREACHABLE', err.message, correlationToken));
-      }
-
-      return res.json({
-        context: {
-          properties: [
-            {
-              namespace: 'Alexa.PowerController',
-              name: 'powerState',
-              value,
-              timeOfSample: new Date().toISOString(),
-              uncertaintyInMilliseconds: 500,
-            },
-          ],
-        },
-        event: {
-          header: {
-            namespace: 'Alexa',
-            name: 'Response',
-            payloadVersion: '3',
-            messageId: uuidv4(),
-            correlationToken,
-          },
-          endpoint: { endpointId },
-          payload: {},
-        },
-      });
-    }
-
-    // ── BrightnessController ──────────────────────────────────────────────────
-    if (namespace === 'Alexa.BrightnessController') {
-      let brightnessValue;
-      let utterance;
-
-      if (name === 'SetBrightness') {
-        brightnessValue = request.directive.payload.brightness;
-        utterance = `set brightness to ${brightnessValue}%`;
-      } else if (name === 'AdjustBrightness') {
-        brightnessValue = request.directive.payload.brightnessDelta;
-        utterance = `adjust brightness by ${brightnessValue}%`;
-      }
-
-      console.log(`[ALEXA] BrightnessController: ${utterance} on device ${endpointId}`);
-
-      try {
-        await homeApi.controlDevice(stored.homeApiToken, endpointId, utterance);
-      } catch (err) {
-        return res.json(buildErrorResponse('ENDPOINT_UNREACHABLE', err.message, correlationToken));
-      }
-
-      return res.json({
-        context: {
-          properties: [
-            {
-              namespace: 'Alexa.BrightnessController',
-              name: 'brightness',
-              value: brightnessValue,
-              timeOfSample: new Date().toISOString(),
-              uncertaintyInMilliseconds: 500,
-            },
-          ],
-        },
-        event: {
-          header: { namespace: 'Alexa', name: 'Response', payloadVersion: '3', messageId: uuidv4(), correlationToken },
-          endpoint: { endpointId },
-          payload: {},
-        },
-      });
-    }
-
-    // ── PowerLevelController (fans, dimmers) ──────────────────────────────────
-    if (namespace === 'Alexa.PowerLevelController') {
-      let powerLevel;
-      let utterance;
-
-      if (name === 'SetPowerLevel') {
-        powerLevel = request.directive.payload.powerLevel;
-        utterance = `set to ${powerLevel}%`;
-      } else if (name === 'AdjustPowerLevel') {
-        powerLevel = request.directive.payload.powerLevelDelta;
-        utterance = `adjust power by ${powerLevel}%`;
-      }
-
-      console.log(`[ALEXA] PowerLevelController: ${utterance} on device ${endpointId}`);
-
-      try {
-        await homeApi.controlDevice(stored.homeApiToken, endpointId, utterance);
-      } catch (err) {
-        return res.json(buildErrorResponse('ENDPOINT_UNREACHABLE', err.message, correlationToken));
-      }
-
-      return res.json({
-        context: {
-          properties: [
-            {
-              namespace: 'Alexa.PowerLevelController',
-              name: 'powerLevel',
-              value: powerLevel,
-              timeOfSample: new Date().toISOString(),
-              uncertaintyInMilliseconds: 500,
-            },
-          ],
-        },
-        event: {
-          header: { namespace: 'Alexa', name: 'Response', payloadVersion: '3', messageId: uuidv4(), correlationToken },
-          endpoint: { endpointId },
-          payload: {},
-        },
-      });
-    }
-
-    // ── PercentageController ──────────────────────────────────────────────────
-    if (namespace === 'Alexa.PercentageController') {
-      let percentage;
-      let utterance;
-
-      if (name === 'SetPercentage') {
-        percentage = request.directive.payload.percentage;
-        utterance = `set to ${percentage}%`;
-      } else if (name === 'AdjustPercentage') {
-        percentage = request.directive.payload.percentageDelta;
-        utterance = `adjust by ${percentage}%`;
-      }
-
-      console.log(`[ALEXA] PercentageController: ${utterance} on device ${endpointId}`);
-
-      try {
-        await homeApi.controlDevice(stored.homeApiToken, endpointId, utterance);
-      } catch (err) {
-        return res.json(buildErrorResponse('ENDPOINT_UNREACHABLE', err.message, correlationToken));
-      }
-
-      return res.json({
-        context: {
-          properties: [
-            {
-              namespace: 'Alexa.PercentageController',
-              name: 'percentage',
-              value: percentage,
-              timeOfSample: new Date().toISOString(),
-              uncertaintyInMilliseconds: 500,
-            },
-          ],
-        },
-        event: {
-          header: { namespace: 'Alexa', name: 'Response', payloadVersion: '3', messageId: uuidv4(), correlationToken },
-          endpoint: { endpointId },
-          payload: {},
-        },
-      });
-    }
-
-    // ── ThermostatController ──────────────────────────────────────────────────
-    if (namespace === 'Alexa.ThermostatController') {
-      let temperature;
-      let utterance;
-
-      if (name === 'SetTargetTemperature') {
-        temperature = request.directive.payload.targetSetpoint.value;
-        const scale = request.directive.payload.targetSetpoint.scale || 'CELSIUS';
-        utterance = `set temperature to ${temperature}`;
-      } else if (name === 'AdjustTargetTemperature') {
-        temperature = request.directive.payload.targetSetpointDelta.value;
-        utterance = `adjust temperature by ${temperature}`;
-      } else if (name === 'SetThermostatMode') {
-        const mode = request.directive.payload.thermostatMode.value;
-        utterance = `set mode to ${mode}`;
-
-        try {
-          await homeApi.controlDevice(stored.homeApiToken, endpointId, utterance);
-        } catch (err) {
-          return res.json(buildErrorResponse('ENDPOINT_UNREACHABLE', err.message, correlationToken));
+      if (comp) {
+        // This is a component — use the correct utterance based on device type
+        const params = { status: onOff, switch_no: comp.switchNo };
+        if (comp.channel) {
+          params.channel = comp.channel;
         }
+        console.log(`[ALEXA] Power: ${onOff} component ${endpointId} (parent: ${comp.parentSwitchId}, ${comp.switchNo}, ch: ${comp.channel || 'none'}, utterance: ${comp.controlUtterance})`);
+        try {
+          await homeApi.controlDevice(homeApiToken, comp.parentSwitchId, comp.controlUtterance, params, projectId);
+          invalidateCache(userId);
+        } catch (err) { logControlError(err); return res.json(buildError('ENDPOINT_UNREACHABLE', err.message, correlationToken)); }
+      } else {
+        // Might be a direct switch or unknown — try direct utterance
+        console.log(`[ALEXA] Power: ${onOff} device ${endpointId} (direct)`);
+        try {
+          await homeApi.controlDevice(homeApiToken, endpointId, `turn ${onOff}`, {}, projectId);
+          invalidateCache(userId);
+        } catch (err) { logControlError(err); return res.json(buildError('ENDPOINT_UNREACHABLE', err.message, correlationToken)); }
+      }
 
+      return res.json({
+        context: { properties: [{ namespace: 'Alexa.PowerController', name: 'powerState', value: onOff === 'on' ? 'ON' : 'OFF', timeOfSample: new Date().toISOString(), uncertaintyInMilliseconds: 500 }] },
+        event: { header: { namespace: 'Alexa', name: 'Response', payloadVersion: '3', messageId: uuidv4(), correlationToken }, endpoint: { endpointId }, payload: {} },
+      });
+    }
+
+    // ── BrightnessController ────────────────────────────────────────────────
+    if (namespace === 'Alexa.BrightnessController') {
+      const brightness = request.directive.payload.brightness ?? request.directive.payload.brightnessDelta;
+      const comp = componentMap[endpointId];
+      const utterance = name === 'SetBrightness' ? `set brightness to ${brightness}%` : `adjust brightness by ${brightness}%`;
+      console.log(`[ALEXA] Brightness: ${utterance} on ${endpointId}`);
+
+      try {
+        if (comp) {
+          const params = { status: `${brightness}`, switch_no: comp.switchNo };
+          if (comp.channel) params.channel = comp.channel;
+          await homeApi.controlDevice(homeApiToken, comp.parentSwitchId, comp.controlUtterance, params, projectId);
+        } else {
+          await homeApi.controlDevice(homeApiToken, endpointId, utterance, {}, projectId);
+        }
+        invalidateCache(userId);
+      } catch (err) { logControlError(err); return res.json(buildError('ENDPOINT_UNREACHABLE', err.message, correlationToken)); }
+
+      return res.json({
+        context: { properties: [{ namespace: 'Alexa.BrightnessController', name: 'brightness', value: brightness, timeOfSample: new Date().toISOString(), uncertaintyInMilliseconds: 500 }] },
+        event: { header: { namespace: 'Alexa', name: 'Response', payloadVersion: '3', messageId: uuidv4(), correlationToken }, endpoint: { endpointId }, payload: {} },
+      });
+    }
+
+    // ── PowerLevelController (fans) ─────────────────────────────────────────
+    if (namespace === 'Alexa.PowerLevelController') {
+      const level = request.directive.payload.powerLevel ?? request.directive.payload.powerLevelDelta;
+      const comp = componentMap[endpointId];
+      console.log(`[ALEXA] PowerLevel: ${level} on ${endpointId}`);
+
+      try {
+        if (comp) {
+          const params = { status: `${level}`, switch_no: comp.switchNo };
+          if (comp.channel) params.channel = comp.channel;
+          await homeApi.controlDevice(homeApiToken, comp.parentSwitchId, comp.controlUtterance, params, projectId);
+        } else {
+          await homeApi.controlDevice(homeApiToken, endpointId, `set to ${level}%`, {}, projectId);
+        }
+        invalidateCache(userId);
+      } catch (err) { logControlError(err); return res.json(buildError('ENDPOINT_UNREACHABLE', err.message, correlationToken)); }
+
+      return res.json({
+        context: { properties: [{ namespace: 'Alexa.PowerLevelController', name: 'powerLevel', value: level, timeOfSample: new Date().toISOString(), uncertaintyInMilliseconds: 500 }] },
+        event: { header: { namespace: 'Alexa', name: 'Response', payloadVersion: '3', messageId: uuidv4(), correlationToken }, endpoint: { endpointId }, payload: {} },
+      });
+    }
+
+    // ── PercentageController ────────────────────────────────────────────────
+    if (namespace === 'Alexa.PercentageController') {
+      const pct = request.directive.payload.percentage ?? request.directive.payload.percentageDelta;
+      const comp = componentMap[endpointId];
+      console.log(`[ALEXA] Percentage: ${pct}% on ${endpointId}`);
+
+      try {
+        if (comp) {
+          const params = { status: `${pct}`, switch_no: comp.switchNo };
+          if (comp.channel) params.channel = comp.channel;
+          await homeApi.controlDevice(homeApiToken, comp.parentSwitchId, comp.controlUtterance, params, projectId);
+        } else {
+          await homeApi.controlDevice(homeApiToken, endpointId, `set to ${pct}%`, {}, projectId);
+        }
+        invalidateCache(userId);
+      } catch (err) { logControlError(err); return res.json(buildError('ENDPOINT_UNREACHABLE', err.message, correlationToken)); }
+
+      return res.json({
+        context: { properties: [{ namespace: 'Alexa.PercentageController', name: 'percentage', value: pct, timeOfSample: new Date().toISOString(), uncertaintyInMilliseconds: 500 }] },
+        event: { header: { namespace: 'Alexa', name: 'Response', payloadVersion: '3', messageId: uuidv4(), correlationToken }, endpoint: { endpointId }, payload: {} },
+      });
+    }
+
+    // ── ThermostatController ────────────────────────────────────────────────
+    if (namespace === 'Alexa.ThermostatController') {
+      let temp, utterance;
+      if (name === 'SetTargetTemperature') { temp = request.directive.payload.targetSetpoint.value; utterance = `set temperature to ${temp}`; }
+      else if (name === 'AdjustTargetTemperature') { temp = request.directive.payload.targetSetpointDelta.value; utterance = `adjust temperature by ${temp}`; }
+      else if (name === 'SetThermostatMode') {
+        const mode = request.directive.payload.thermostatMode.value;
+        try { await homeApi.controlDevice(homeApiToken, endpointId, `set mode to ${mode}`, { mode }, projectId); invalidateCache(userId); }
+        catch (err) { logControlError(err); return res.json(buildError('ENDPOINT_UNREACHABLE', err.message, correlationToken)); }
         return res.json({
-          context: {
-            properties: [
-              {
-                namespace: 'Alexa.ThermostatController',
-                name: 'thermostatMode',
-                value: mode,
-                timeOfSample: new Date().toISOString(),
-                uncertaintyInMilliseconds: 500,
-              },
-            ],
-          },
-          event: {
-            header: { namespace: 'Alexa', name: 'Response', payloadVersion: '3', messageId: uuidv4(), correlationToken },
-            endpoint: { endpointId },
-            payload: {},
-          },
+          context: { properties: [{ namespace: 'Alexa.ThermostatController', name: 'thermostatMode', value: mode, timeOfSample: new Date().toISOString(), uncertaintyInMilliseconds: 500 }] },
+          event: { header: { namespace: 'Alexa', name: 'Response', payloadVersion: '3', messageId: uuidv4(), correlationToken }, endpoint: { endpointId }, payload: {} },
         });
       }
 
-      console.log(`[ALEXA] ThermostatController: ${utterance} on device ${endpointId}`);
-
-      try {
-        await homeApi.controlDevice(stored.homeApiToken, endpointId, utterance);
-      } catch (err) {
-        return res.json(buildErrorResponse('ENDPOINT_UNREACHABLE', err.message, correlationToken));
-      }
+      console.log(`[ALEXA] Thermostat: ${utterance} on ${endpointId}`);
+      try { await homeApi.controlDevice(homeApiToken, endpointId, utterance, { temperature: temp }, projectId); invalidateCache(userId); }
+      catch (err) { logControlError(err); return res.json(buildError('ENDPOINT_UNREACHABLE', err.message, correlationToken)); }
 
       return res.json({
-        context: {
-          properties: [
-            {
-              namespace: 'Alexa.ThermostatController',
-              name: 'targetSetpoint',
-              value: { value: temperature, scale: 'CELSIUS' },
-              timeOfSample: new Date().toISOString(),
-              uncertaintyInMilliseconds: 500,
-            },
-            {
-              namespace: 'Alexa.TemperatureSensor',
-              name: 'temperature',
-              value: { value: temperature, scale: 'CELSIUS' },
-              timeOfSample: new Date().toISOString(),
-              uncertaintyInMilliseconds: 1000,
-            },
-          ],
-        },
-        event: {
-          header: { namespace: 'Alexa', name: 'Response', payloadVersion: '3', messageId: uuidv4(), correlationToken },
-          endpoint: { endpointId },
-          payload: {},
-        },
+        context: { properties: [
+          { namespace: 'Alexa.ThermostatController', name: 'targetSetpoint', value: { value: temp, scale: 'CELSIUS' }, timeOfSample: new Date().toISOString(), uncertaintyInMilliseconds: 500 },
+          { namespace: 'Alexa.TemperatureSensor', name: 'temperature', value: { value: temp, scale: 'CELSIUS' }, timeOfSample: new Date().toISOString(), uncertaintyInMilliseconds: 1000 },
+        ] },
+        event: { header: { namespace: 'Alexa', name: 'Response', payloadVersion: '3', messageId: uuidv4(), correlationToken }, endpoint: { endpointId }, payload: {} },
       });
     }
 
-    // ── ColorController ───────────────────────────────────────────────────────
+    // ── ColorController ─────────────────────────────────────────────────────
     if (namespace === 'Alexa.ColorController' && name === 'SetColor') {
       const { hue, saturation, brightness } = request.directive.payload.color;
-      const utterance = `set color hue ${hue} saturation ${saturation} brightness ${brightness}`;
-
-      console.log(`[ALEXA] ColorController: ${utterance} on device ${endpointId}`);
-
-      try {
-        await homeApi.controlDevice(stored.homeApiToken, endpointId, utterance);
-      } catch (err) {
-        return res.json(buildErrorResponse('ENDPOINT_UNREACHABLE', err.message, correlationToken));
-      }
-
+      console.log(`[ALEXA] Color: h=${hue} s=${saturation} b=${brightness} on ${endpointId}`);
+      try { await homeApi.controlDevice(homeApiToken, endpointId, `set color hue ${hue} saturation ${saturation} brightness ${brightness}`, { hue, saturation, brightness }, projectId); invalidateCache(userId); }
+      catch (err) { logControlError(err); return res.json(buildError('ENDPOINT_UNREACHABLE', err.message, correlationToken)); }
       return res.json({
-        context: {
-          properties: [
-            {
-              namespace: 'Alexa.ColorController',
-              name: 'color',
-              value: { hue, saturation, brightness },
-              timeOfSample: new Date().toISOString(),
-              uncertaintyInMilliseconds: 500,
-            },
-          ],
-        },
-        event: {
-          header: { namespace: 'Alexa', name: 'Response', payloadVersion: '3', messageId: uuidv4(), correlationToken },
-          endpoint: { endpointId },
-          payload: {},
-        },
+        context: { properties: [{ namespace: 'Alexa.ColorController', name: 'color', value: { hue, saturation, brightness }, timeOfSample: new Date().toISOString(), uncertaintyInMilliseconds: 500 }] },
+        event: { header: { namespace: 'Alexa', name: 'Response', payloadVersion: '3', messageId: uuidv4(), correlationToken }, endpoint: { endpointId }, payload: {} },
       });
     }
 
-    // ── ColorTemperatureController ────────────────────────────────────────────
+    // ── ColorTemperatureController ──────────────────────────────────────────
     if (namespace === 'Alexa.ColorTemperatureController') {
-      let kelvin;
-      let utterance;
-
-      if (name === 'SetColorTemperature') {
-        kelvin = request.directive.payload.colorTemperatureInKelvin;
-        utterance = `set color temperature to ${kelvin}`;
-      } else if (name === 'IncreaseColorTemperature') {
-        utterance = 'set warm white';
-        kelvin = 4000;
-      } else if (name === 'DecreaseColorTemperature') {
-        utterance = 'set cool white';
-        kelvin = 7000;
-      }
-
-      console.log(`[ALEXA] ColorTemperatureController: ${utterance} on device ${endpointId}`);
-
-      try {
-        await homeApi.controlDevice(stored.homeApiToken, endpointId, utterance);
-      } catch (err) {
-        return res.json(buildErrorResponse('ENDPOINT_UNREACHABLE', err.message, correlationToken));
-      }
-
+      let kelvin, utterance;
+      if (name === 'SetColorTemperature') { kelvin = request.directive.payload.colorTemperatureInKelvin; utterance = `set color temperature to ${kelvin}`; }
+      else if (name === 'IncreaseColorTemperature') { utterance = 'set warm white'; kelvin = 4000; }
+      else if (name === 'DecreaseColorTemperature') { utterance = 'set cool white'; kelvin = 7000; }
+      console.log(`[ALEXA] ColorTemp: ${utterance} on ${endpointId}`);
+      try { await homeApi.controlDevice(homeApiToken, endpointId, utterance, {}, projectId); invalidateCache(userId); }
+      catch (err) { logControlError(err); return res.json(buildError('ENDPOINT_UNREACHABLE', err.message, correlationToken)); }
       return res.json({
-        context: {
-          properties: [
-            {
-              namespace: 'Alexa.ColorTemperatureController',
-              name: 'colorTemperatureInKelvin',
-              value: kelvin,
-              timeOfSample: new Date().toISOString(),
-              uncertaintyInMilliseconds: 500,
-            },
-          ],
-        },
-        event: {
-          header: { namespace: 'Alexa', name: 'Response', payloadVersion: '3', messageId: uuidv4(), correlationToken },
-          endpoint: { endpointId },
-          payload: {},
-        },
+        context: { properties: [{ namespace: 'Alexa.ColorTemperatureController', name: 'colorTemperatureInKelvin', value: kelvin, timeOfSample: new Date().toISOString(), uncertaintyInMilliseconds: 500 }] },
+        event: { header: { namespace: 'Alexa', name: 'Response', payloadVersion: '3', messageId: uuidv4(), correlationToken }, endpoint: { endpointId }, payload: {} },
       });
     }
 
-    // ── ReportState ───────────────────────────────────────────────────────────
+    // ── ReportState ─────────────────────────────────────────────────────────
     if (namespace === 'Alexa' && name === 'ReportState') {
-      console.log(`[ALEXA] ReportState for device ${endpointId}`);
-
-      // Fetch current device state from the home API
       let properties = [];
       try {
-        const spacesData = await homeApi.listDevices(stored.homeApiToken, {});
-        const device = spacesData.data?.devices?.[endpointId];
+        const spacesData = await getCachedDevices(userId, homeApiToken, projectId);
+        properties = getComponentState(endpointId, spacesData.data);
+      } catch (err) { console.error(`[ALEXA] ReportState error: ${err.message}`); }
 
-        if (device) {
-          properties = buildStateProperties(device);
-        }
-      } catch (err) {
-        console.error(`[ALEXA] ReportState error: ${err.message}`);
-      }
-
-      // Always include endpoint health
-      properties.push({
-        namespace: 'Alexa.EndpointHealth',
-        name: 'connectivity',
-        value: { value: 'OK' },
-        timeOfSample: new Date().toISOString(),
-        uncertaintyInMilliseconds: 200,
-      });
+      properties.push({ namespace: 'Alexa.EndpointHealth', name: 'connectivity', value: { value: 'OK' }, timeOfSample: new Date().toISOString(), uncertaintyInMilliseconds: 200 });
 
       return res.json({
         context: { properties },
-        event: {
-          header: {
-            namespace: 'Alexa',
-            name: 'StateReport',
-            payloadVersion: '3',
-            messageId: uuidv4(),
-            correlationToken,
-          },
-          endpoint: {
-            scope: { type: 'BearerToken', token },
-            endpointId,
-          },
-          payload: {},
-        },
+        event: { header: { namespace: 'Alexa', name: 'StateReport', payloadVersion: '3', messageId: uuidv4(), correlationToken },
+          endpoint: { scope: { type: 'BearerToken', token }, endpointId }, payload: {} },
       });
     }
 
-    // ── Unhandled namespace ───────────────────────────────────────────────────
-    console.warn(`[ALEXA] Unhandled directive: ${namespace}.${name}`);
-    return res.json(buildErrorResponse('INVALID_DIRECTIVE', `Unsupported: ${namespace}.${name}`, correlationToken));
+    console.warn(`[ALEXA] Unhandled: ${namespace}.${name}`);
+    return res.json(buildError('INVALID_DIRECTIVE', `Unsupported: ${namespace}.${name}`, correlationToken));
 
   } catch (err) {
-    console.error('[ALEXA] Unexpected error:', err);
-    return res.json(buildErrorResponse('INTERNAL_ERROR', err.message));
+    console.error('[ALEXA] Unexpected:', err.message);
+    return res.json(buildError('INTERNAL_ERROR', err.message));
   }
 });
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  HELPER FUNCTIONS
+//  HELPER: Build Alexa Endpoints from IOtiq Data
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/**
- * Resolve a user from the Alexa Bearer token.
- * Returns { userId, stored } where stored contains the home-API credentials.
- */
-function resolveUser(token) {
-  if (!token) return { userId: null, stored: null };
-
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    const userId = payload.sub;
-    const stored = getHomeToken(userId);
-    return { userId, stored };
-  } catch (err) {
-    console.error('[resolveUser] Token verification failed:', err.message);
-    return { userId: null, stored: null };
-  }
-}
-
-/**
- * Map IOtiq Connect devices/switches/scenes to Alexa Smart Home v3 endpoints.
- *
- * The listDevices API returns: { project, spaces, floors, rooms, devices, switches, scenes }
- * We iterate over devices and map each one to an Alexa endpoint with appropriate capabilities.
- */
-function mapDevicesToAlexaEndpoints(data) {
+function buildAlexaEndpoints(data) {
   const endpoints = [];
-
   if (!data) return endpoints;
 
-  // ── Map Devices ─────────────────────────────────────────────────────────────
-  const devices = data.devices || {};
-  for (const [deviceId, device] of Object.entries(devices)) {
-    const deviceType = (device.metadata?.type || 'Switch').toLowerCase();
-    const endpoint = {
-      endpointId: deviceId,
-      manufacturerName: 'IOtiq Connect',
-      friendlyName: device.name || `Device ${deviceId.slice(0, 6)}`,
-      description: `${device.name || 'Device'} via IOtiq Connect`,
-      displayCategories: getDisplayCategories(deviceType),
-      cookie: {
-        deviceType,
-        roomId: device.roomId || null,
-      },
-      capabilities: [
-        ...getCapabilities(deviceType),
-        // Required on every endpoint
-        {
-          type: 'AlexaInterface',
-          interface: 'Alexa.EndpointHealth',
-          version: '3',
-          properties: {
-            supported: [{ name: 'connectivity' }],
-            proactivelyReported: true,
-            retrievable: true,
-          },
-        },
-        {
-          type: 'AlexaInterface',
-          interface: 'Alexa',
-          version: '3',
-        },
-      ],
-    };
+  // ── COMPONENTS are the real Alexa endpoints ─────────────────────────────
+  // Iterate over BOTH switches (switch controllers) AND devices (dongles, IR blasters)
+  // Both have the same structure: { Components, Item, Segments, ... }
+  const allParentDevices = {
+    ...(data.switches || {}),
+    ...(data.devices || {}),
+  };
 
-    endpoints.push(endpoint);
+  for (const [parentId, sw] of Object.entries(allParentDevices)) {
+    const components = sw.Components || [];
+    const roomName = sw.Segments?.[0]?.name || '';
+    const floorName = sw.Segments?.[0]?.ParentSegment?.name || '';
+
+    for (const comp of components) {
+      if (comp.isDeleted) continue;
+      if (!comp.metadata) continue; // Skip unconfigured component slots
+
+      const compType = (comp.metadata?.type || 'switch').toLowerCase();
+      const compDeviceName = comp.metadata?.deviceName || comp.name || '';
+
+      // Build a useful, unique friendly name
+      // Priority: room + deviceName > room + type + number > deviceName + number > type + number
+      let friendlyName;
+      const isGenericName = !compDeviceName || compDeviceName.toLowerCase() === 'switch' || compDeviceName.toLowerCase() === 'light';
+
+      if (!isGenericName && roomName) {
+        // Best case: "Kitchen CS Light"
+        friendlyName = `${roomName} ${compDeviceName}`;
+      } else if (!isGenericName) {
+        // No room but has unique name: "CS Light"
+        friendlyName = compDeviceName;
+      } else if (roomName) {
+        // Generic name with room: "Kitchen Light 1" or "Kitchen Switch 2"
+        const typeLabel = compType.charAt(0).toUpperCase() + compType.slice(1);
+        friendlyName = `${roomName} ${typeLabel} ${comp.componentNumber}`;
+      } else {
+        // No room, generic name: use parent device name + component number
+        const parentName = sw.Item?.name || sw.deviceName || 'Device';
+        friendlyName = `${parentName} ${compType} ${comp.componentNumber}`;
+      }
+
+      const alexaType = normalizeType(compType);
+
+      endpoints.push({
+        endpointId: comp.id,
+        manufacturerName: 'IOtiq Connect',
+        friendlyName,
+        description: `${friendlyName} via IOtiq Connect`,
+        displayCategories: getCategories(alexaType),
+        cookie: {
+          deviceType: alexaType,
+          rawType: compType,
+          parentSwitchId: parentId,
+          switchNo: comp.metadata?.switch_no || `S${comp.componentNumber}`,
+          room: roomName,
+          floor: floorName,
+        },
+        capabilities: [
+          ...getCapabilities(alexaType),
+          { type: 'AlexaInterface', interface: 'Alexa.EndpointHealth', version: '3', properties: { supported: [{ name: 'connectivity' }], proactivelyReported: true, retrievable: true } },
+          { type: 'AlexaInterface', interface: 'Alexa', version: '3' },
+        ],
+      });
+    }
   }
 
-  // ── Map Switches (standalone relays etc.) ───────────────────────────────────
-  const switches = data.switches || {};
-  for (const [switchId, sw] of Object.entries(switches)) {
-    // Avoid duplicates if switch IDs overlap with device IDs
-    if (devices[switchId]) continue;
-
-    endpoints.push({
-      endpointId: switchId,
-      manufacturerName: 'IOtiq Connect',
-      friendlyName: sw.name || `Switch ${switchId.slice(0, 6)}`,
-      description: `${sw.name || 'Switch'} via IOtiq Connect`,
-      displayCategories: ['SWITCH'],
-      cookie: { deviceType: 'switch' },
-      capabilities: [
-        {
-          type: 'AlexaInterface',
-          interface: 'Alexa.PowerController',
-          version: '3',
-          properties: {
-            supported: [{ name: 'powerState' }],
-            proactivelyReported: true,
-            retrievable: true,
-          },
-        },
-        {
-          type: 'AlexaInterface',
-          interface: 'Alexa.EndpointHealth',
-          version: '3',
-          properties: {
-            supported: [{ name: 'connectivity' }],
-            proactivelyReported: true,
-            retrievable: true,
-          },
-        },
-        { type: 'AlexaInterface', interface: 'Alexa', version: '3' },
-      ],
-    });
-  }
-
-  // ── Map Scenes ──────────────────────────────────────────────────────────────
+  // ── Scenes ──────────────────────────────────────────────────────────────
   const scenes = data.scenes || {};
   for (const [sceneId, scene] of Object.entries(scenes)) {
     endpoints.push({
       endpointId: sceneId,
       manufacturerName: 'IOtiq Connect',
-      friendlyName: scene.name || `Scene ${sceneId.slice(0, 6)}`,
+      friendlyName: scene.name || scene.displayName || `Scene ${sceneId.slice(0, 6)}`,
       description: `${scene.name || 'Scene'} via IOtiq Connect`,
       displayCategories: ['SCENE_TRIGGER'],
       cookie: { deviceType: 'scene' },
       capabilities: [
-        {
-          type: 'AlexaInterface',
-          interface: 'Alexa.SceneController',
-          version: '3',
-          supportsDeactivation: false,
-          proactivelyReported: true,
-        },
+        { type: 'AlexaInterface', interface: 'Alexa.SceneController', version: '3', supportsDeactivation: false, proactivelyReported: true },
         { type: 'AlexaInterface', interface: 'Alexa', version: '3' },
       ],
     });
@@ -951,364 +730,127 @@ function mapDevicesToAlexaEndpoints(data) {
 }
 
 /**
- * Map a device type string to Alexa displayCategories.
+ * Get the current state of a component for ReportState.
+ * Looks up the parent switch's deviceState for the component's switch_no.
  */
-function getDisplayCategories(deviceType) {
-  const map = {
-    light: ['LIGHT'],
-    dimmer: ['LIGHT'],
-    bulb: ['LIGHT'],
-    rgb: ['LIGHT'],
-    rgbw: ['LIGHT'],
-    switch: ['SWITCH'],
-    plug: ['SMARTPLUG'],
-    socket: ['SMARTPLUG'],
-    fan: ['FAN'],
-    thermostat: ['THERMOSTAT'],
-    ac: ['THERMOSTAT'],
-    tv: ['TV'],
-    television: ['TV'],
-    curtain: ['INTERIOR_BLIND'],
-    blind: ['INTERIOR_BLIND'],
-    lock: ['SMARTLOCK'],
-    camera: ['CAMERA'],
-    sensor: ['CONTACT_SENSOR'],
-    motion: ['MOTION_SENSOR'],
-    speaker: ['SPEAKER'],
-    scene: ['SCENE_TRIGGER'],
-  };
-  return map[deviceType] || ['OTHER'];
-}
-
-/**
- * Map a device type string to the appropriate Alexa capabilities.
- */
-function getCapabilities(deviceType) {
-  // Base power control (almost everything has this)
-  const powerController = {
-    type: 'AlexaInterface',
-    interface: 'Alexa.PowerController',
-    version: '3',
-    properties: {
-      supported: [{ name: 'powerState' }],
-      proactivelyReported: true,
-      retrievable: true,
-    },
-  };
-
-  const brightnessController = {
-    type: 'AlexaInterface',
-    interface: 'Alexa.BrightnessController',
-    version: '3',
-    properties: {
-      supported: [{ name: 'brightness' }],
-      proactivelyReported: true,
-      retrievable: true,
-    },
-  };
-
-  const colorController = {
-    type: 'AlexaInterface',
-    interface: 'Alexa.ColorController',
-    version: '3',
-    properties: {
-      supported: [{ name: 'color' }],
-      proactivelyReported: true,
-      retrievable: true,
-    },
-  };
-
-  const colorTemperatureController = {
-    type: 'AlexaInterface',
-    interface: 'Alexa.ColorTemperatureController',
-    version: '3',
-    properties: {
-      supported: [{ name: 'colorTemperatureInKelvin' }],
-      proactivelyReported: true,
-      retrievable: true,
-    },
-  };
-
-  const powerLevelController = {
-    type: 'AlexaInterface',
-    interface: 'Alexa.PowerLevelController',
-    version: '3',
-    properties: {
-      supported: [{ name: 'powerLevel' }],
-      proactivelyReported: true,
-      retrievable: true,
-    },
-  };
-
-  const percentageController = {
-    type: 'AlexaInterface',
-    interface: 'Alexa.PercentageController',
-    version: '3',
-    properties: {
-      supported: [{ name: 'percentage' }],
-      proactivelyReported: true,
-      retrievable: true,
-    },
-  };
-
-  const thermostatController = {
-    type: 'AlexaInterface',
-    interface: 'Alexa.ThermostatController',
-    version: '3',
-    properties: {
-      supported: [{ name: 'targetSetpoint' }, { name: 'thermostatMode' }],
-      proactivelyReported: true,
-      retrievable: true,
-    },
-    configuration: {
-      supportedModes: ['HEAT', 'COOL', 'AUTO'],
-      supportsScheduling: false,
-    },
-  };
-
-  const temperatureSensor = {
-    type: 'AlexaInterface',
-    interface: 'Alexa.TemperatureSensor',
-    version: '3',
-    properties: {
-      supported: [{ name: 'temperature' }],
-      proactivelyReported: true,
-      retrievable: true,
-    },
-  };
-
-  switch (deviceType) {
-    case 'light':
-    case 'bulb':
-      return [powerController, brightnessController];
-
-    case 'dimmer':
-      return [powerController, brightnessController, powerLevelController, percentageController];
-
-    case 'rgb':
-    case 'rgbw':
-      return [powerController, brightnessController, colorController, colorTemperatureController];
-
-    case 'fan':
-      return [powerController, powerLevelController, percentageController];
-
-    case 'thermostat':
-    case 'ac':
-      return [powerController, thermostatController, temperatureSensor];
-
-    case 'curtain':
-    case 'blind':
-      return [powerController, percentageController];
-
-    case 'tv':
-    case 'television':
-      return [
-        powerController,
-        {
-          type: 'AlexaInterface',
-          interface: 'Alexa.ChannelController',
-          version: '3',
-          properties: {
-            supported: [{ name: 'channel' }],
-            proactivelyReported: true,
-            retrievable: true,
-          },
-        },
-      ];
-
-    case 'speaker':
-      return [
-        powerController,
-        {
-          type: 'AlexaInterface',
-          interface: 'Alexa.Speaker',
-          version: '3',
-          properties: {
-            supported: [{ name: 'volume' }, { name: 'muted' }],
-            proactivelyReported: true,
-            retrievable: true,
-          },
-        },
-      ];
-
-    case 'lock':
-      return [
-        {
-          type: 'AlexaInterface',
-          interface: 'Alexa.LockController',
-          version: '3',
-          properties: {
-            supported: [{ name: 'lockState' }],
-            proactivelyReported: true,
-            retrievable: true,
-          },
-        },
-      ];
-
-    case 'switch':
-    case 'plug':
-    case 'socket':
-    default:
-      return [powerController];
-  }
-}
-
-/**
- * Build state properties from a device's current data for ReportState.
- */
-function buildStateProperties(device) {
+function getComponentState(componentId, data) {
   const properties = [];
-  const deviceType = (device.metadata?.type || 'switch').toLowerCase();
   const now = new Date().toISOString();
+  const comp = componentMap[componentId];
 
-  // Power state
-  const isOn = device.status === 'ON' || device.status === 'ONLINE' || device.state?.power === true;
-  properties.push({
-    namespace: 'Alexa.PowerController',
-    name: 'powerState',
-    value: isOn ? 'ON' : 'OFF',
-    timeOfSample: now,
-    uncertaintyInMilliseconds: 500,
-  });
+  if (!comp) return properties;
 
-  // Brightness (if applicable)
-  if (['light', 'dimmer', 'bulb', 'rgb', 'rgbw'].includes(deviceType) && device.state?.brightness != null) {
-    properties.push({
-      namespace: 'Alexa.BrightnessController',
-      name: 'brightness',
-      value: device.state.brightness,
-      timeOfSample: now,
-      uncertaintyInMilliseconds: 500,
-    });
+  // Find the parent in switches OR devices
+  const sw = data?.switches?.[comp.parentSwitchId] || data?.devices?.[comp.parentSwitchId];
+  if (!sw) return properties;
+
+  // Check component-level state from deviceState
+  const compState = sw.deviceState?.[componentId];
+  let isOn = false;
+
+  if (compState?.parameterStateStore?.status) {
+    const s = compState.parameterStateStore.status;
+    isOn = s === '1' || s === 'on' || s === 'ON';
+  } else {
+    // Fallback to top-level deviceState
+    isOn = sw.deviceState?.status === 'on' || sw.deviceState?.status === 'ON';
   }
 
-  // Temperature (if applicable)
-  if (['thermostat', 'ac'].includes(deviceType) && device.state?.temperature != null) {
-    properties.push({
-      namespace: 'Alexa.TemperatureSensor',
-      name: 'temperature',
-      value: { value: device.state.temperature, scale: 'CELSIUS' },
-      timeOfSample: now,
-      uncertaintyInMilliseconds: 1000,
-    });
-  }
-
-  // Thermostat target (if applicable)
-  if (['thermostat', 'ac'].includes(deviceType) && device.state?.targetTemperature != null) {
-    properties.push({
-      namespace: 'Alexa.ThermostatController',
-      name: 'targetSetpoint',
-      value: { value: device.state.targetTemperature, scale: 'CELSIUS' },
-      timeOfSample: now,
-      uncertaintyInMilliseconds: 500,
-    });
-  }
+  properties.push({ namespace: 'Alexa.PowerController', name: 'powerState', value: isOn ? 'ON' : 'OFF', timeOfSample: now, uncertaintyInMilliseconds: 500 });
 
   return properties;
 }
 
-/**
- * Build an Alexa error response.
- */
-function buildErrorResponse(type, message, correlationToken) {
-  return {
-    event: {
-      header: {
-        namespace: 'Alexa',
-        name: 'ErrorResponse',
-        payloadVersion: '3',
-        messageId: uuidv4(),
-        ...(correlationToken && { correlationToken }),
-      },
-      payload: {
-        type,
-        message,
-      },
-    },
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TYPE & CAPABILITY MAPS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function normalizeType(t) {
+  const map = {
+    light: 'light', lamp: 'light', bulb: 'light', led: 'light', tubelight: 'light',
+    dimmer: 'dimmer', dimmable: 'dimmer',
+    rgb: 'rgb', rgbw: 'rgb',
+    fan: 'fan', 'ceiling fan': 'fan', 'exhaust fan': 'fan',
+    switch: 'switch', relay: 'switch', socket: 'plug', plug: 'plug', outlet: 'plug',
+    curtain: 'curtain', blind: 'curtain', shade: 'curtain',
+    thermostat: 'thermostat', ac: 'thermostat', 'air conditioner': 'thermostat',
+    tv: 'tv', speaker: 'speaker', lock: 'lock', camera: 'camera',
   };
+  return map[t] || 'switch';
+}
+
+function getCategories(t) {
+  const map = { light: ['LIGHT'], dimmer: ['LIGHT'], rgb: ['LIGHT'], switch: ['SWITCH'], plug: ['SMARTPLUG'], fan: ['FAN'], thermostat: ['THERMOSTAT'], tv: ['TV'], curtain: ['INTERIOR_BLIND'], lock: ['SMARTLOCK'], speaker: ['SPEAKER'], camera: ['CAMERA'] };
+  return map[t] || ['SWITCH'];
+}
+
+function getCapabilities(t) {
+  const power = { type: 'AlexaInterface', interface: 'Alexa.PowerController', version: '3', properties: { supported: [{ name: 'powerState' }], proactivelyReported: true, retrievable: true } };
+  const brightness = { type: 'AlexaInterface', interface: 'Alexa.BrightnessController', version: '3', properties: { supported: [{ name: 'brightness' }], proactivelyReported: true, retrievable: true } };
+  const color = { type: 'AlexaInterface', interface: 'Alexa.ColorController', version: '3', properties: { supported: [{ name: 'color' }], proactivelyReported: true, retrievable: true } };
+  const colorTemp = { type: 'AlexaInterface', interface: 'Alexa.ColorTemperatureController', version: '3', properties: { supported: [{ name: 'colorTemperatureInKelvin' }], proactivelyReported: true, retrievable: true } };
+  const powerLevel = { type: 'AlexaInterface', interface: 'Alexa.PowerLevelController', version: '3', properties: { supported: [{ name: 'powerLevel' }], proactivelyReported: true, retrievable: true } };
+  const percentage = { type: 'AlexaInterface', interface: 'Alexa.PercentageController', version: '3', properties: { supported: [{ name: 'percentage' }], proactivelyReported: true, retrievable: true } };
+  const thermostat = { type: 'AlexaInterface', interface: 'Alexa.ThermostatController', version: '3', properties: { supported: [{ name: 'targetSetpoint' }, { name: 'thermostatMode' }], proactivelyReported: true, retrievable: true }, configuration: { supportedModes: ['HEAT', 'COOL', 'AUTO'], supportsScheduling: false } };
+  const tempSensor = { type: 'AlexaInterface', interface: 'Alexa.TemperatureSensor', version: '3', properties: { supported: [{ name: 'temperature' }], proactivelyReported: true, retrievable: true } };
+
+  switch (t) {
+    case 'light':      return [power, brightness];
+    case 'dimmer':     return [power, brightness, powerLevel, percentage];
+    case 'rgb':        return [power, brightness, color, colorTemp];
+    case 'fan':        return [power, powerLevel, percentage];
+    case 'thermostat': return [power, thermostat, tempSensor];
+    case 'curtain':    return [power, percentage];
+    case 'tv':         return [power];
+    case 'speaker':    return [power];
+    case 'lock':       return [power];
+    default:           return [power];
+  }
 }
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  Health Check / Home Page
+//  UTILITIES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function resolveUser(token) {
+  if (!token) return { userId: null, stored: null };
+  try {
+    const p = jwt.verify(token, JWT_SECRET);
+    const cached = getHomeToken(p.sub);
+    if (cached?.homeApiToken) return { userId: p.sub, stored: cached };
+
+    const recovered = recoverHomeTokenFromRefresh(p.sub);
+    return { userId: p.sub, stored: recovered };
+  } catch { return { userId: null, stored: null }; }
+}
+
+function buildError(type, message, correlationToken) {
+  return { event: { header: { namespace: 'Alexa', name: 'ErrorResponse', payloadVersion: '3', messageId: uuidv4(), ...(correlationToken && { correlationToken }) }, payload: { type, message } } };
+}
+
+function logControlError(err) {
+  console.error(`[ALEXA] Control error: ${err.message}`);
+  if (err.response) {
+    console.error(`[ALEXA] Status: ${err.response.status}`);
+    console.error(`[ALEXA] Body:`, JSON.stringify(err.response.data, null, 2));
+  }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  START
 // ═══════════════════════════════════════════════════════════════════════════════
 app.get('/', (req, res) => {
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>IOtiq Connect — Alexa Integration Server</title>
-      <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
-        h1 { color: #333; }
-        .status { color: green; font-weight: bold; }
-        .endpoint { background: #f5f5f5; padding: 15px; margin: 10px 0; border-left: 3px solid #0066cc; }
-        code { background: #e0e0e0; padding: 2px 6px; border-radius: 3px; font-family: monospace; }
-        .config-box { background: #e7f3ff; padding: 20px; margin: 20px 0; border-radius: 5px; border: 1px solid #0066cc; }
-        .config-item { margin: 10px 0; padding: 10px; background: white; border-radius: 3px; }
-        .label { font-weight: bold; color: #555; display: block; margin-bottom: 5px; }
-      </style>
-    </head>
-    <body>
-      <h1>IOtiq Connect — Alexa Integration Server</h1>
-      <p>Status: <span class="status">Running</span></p>
-      <p>Home API: <code>${homeApiBaseUrl}</code></p>
-      <p>Linked users: <strong>${Object.keys(homeTokenStore).length}</strong></p>
-
-      <div class="config-box">
-        <h3>Alexa Skill Account Linking Configuration</h3>
-        <div class="config-item">
-          <span class="label">Authorization URI:</span>
-          <code>https://YOUR_DOMAIN/authorize</code>
-        </div>
-        <div class="config-item">
-          <span class="label">Access Token URI:</span>
-          <code>https://YOUR_DOMAIN/token</code>
-        </div>
-        <div class="config-item">
-          <span class="label">Client ID:</span>
-          <code>alexa-skill</code>
-        </div>
-        <div class="config-item">
-          <span class="label">Client Secret:</span>
-          <code>alexa-client-secret</code>
-        </div>
-      </div>
-
-      <div class="config-box">
-        <h3>Alexa Smart Home Skill Endpoint</h3>
-        <div class="config-item">
-          <span class="label">Skill Endpoint (HTTPS):</span>
-          <code>https://YOUR_DOMAIN/alexa/smart-home</code>
-        </div>
-        <p style="margin-top:10px; font-size:0.9rem; color:#555;">
-          In the Alexa Developer Console, set the Smart Home skill's Default Endpoint
-          to the HTTPS URL above (instead of an AWS Lambda ARN).
-        </p>
-      </div>
-
-      <h2>Endpoints:</h2>
-      <div class="endpoint"><strong>GET</strong> <code>/authorize</code> — OAuth authorization</div>
-      <div class="endpoint"><strong>POST</strong> <code>/token</code> — OAuth token exchange</div>
-      <div class="endpoint"><strong>GET</strong> <code>/userinfo</code> — User profile</div>
-      <div class="endpoint"><strong>POST</strong> <code>/alexa/smart-home</code> — Alexa Smart Home directives (discovery, control, state)</div>
-    </body>
-    </html>
-  `);
+  res.send(`<h1>IOtiq Connect Alexa Server</h1><p>Running | API: ${homeApiBaseUrl} | Users: ${Object.keys(homeTokenStore).length}</p>`);
 });
 
-// ─── Start Server ─────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log('══════════════════════════════════════════');
-  console.log(' IOtiq Connect — Alexa Integration Server');
-  console.log('══════════════════════════════════════════');
-  console.log(` Port:     ${PORT}`);
-  console.log(` Home API: ${homeApiBaseUrl}`);
-  console.log(` Local:    http://localhost:${PORT}`);
-  console.log('──────────────────────────────────────────');
-  console.log(' Alexa Skill Config:');
-  console.log('   Authorization URI: https://YOUR_DOMAIN/authorize');
-  console.log('   Access Token URI:  https://YOUR_DOMAIN/token');
-  console.log('   Skill Endpoint:    https://YOUR_DOMAIN/alexa/smart-home');
+  console.log(` IOtiq Connect — Alexa Integration Server`);
+  console.log(`  Port: ${PORT} | Home API: ${homeApiBaseUrl}`);
+  console.log(`  OAuth Client ID: ${ALEXA_CLIENT_ID}`);
+  console.log(`  Redirect URIs configured: ${configuredRedirectUris.length}`);
   console.log('══════════════════════════════════════════');
 });
