@@ -45,6 +45,7 @@ const PORT = process.env.PORT || 3000;
 const JWT_SECRET = jwtSecret;
 const CODE_TTL_SEC = 600;
 const ACCESS_TOKEN_TTL_SEC = accessTokenTTL || 3600;
+const ALWAYS_SHOW_LOGIN = String(process.env.ALWAYS_SHOW_LOGIN || '').toLowerCase() === 'true';
 
 // ─── OAuth Clients ────────────────────────────────────────────────────────────
 const ALEXA_CLIENT_ID = process.env.ALEXA_CLIENT_ID || 'alexa-skill';
@@ -335,11 +336,22 @@ app.get('/authorize', (req, res) => {
     return res.status(400).send('Invalid redirect_uri');
   }
 
+  const continueTo = `/authorize?${querystring.stringify(req.query)}`;
+  const forceLogin = ALWAYS_SHOW_LOGIN || String(req.query.prompt || '').toLowerCase() === 'login';
+  if (forceLogin) {
+    if (req.cookies.userId) {
+      console.log(`[AUTHORIZE] Force login enabled, clearing userId cookie`);
+    }
+    res.clearCookie('userId');
+    return res.redirect(`/login?continue=${encodeURIComponent(continueTo)}`);
+  }
+
   if (!req.cookies.userId) {
-    return res.redirect(`/login?continue=${encodeURIComponent(`/authorize?${querystring.stringify(req.query)}`)}`);
+    return res.redirect(`/login?continue=${encodeURIComponent(continueTo)}`);
   }
 
   const userId = req.cookies.userId;
+  console.log(`[AUTHORIZE] Reusing login session for userId=${userId}`);
   let stored = getHomeToken(userId);
   if (!stored?.homeApiToken) {
     stored = recoverHomeTokenFromRefresh(userId);
@@ -348,7 +360,7 @@ app.get('/authorize', (req, res) => {
   if (!stored?.homeApiToken || isJwtExpired(stored.homeApiToken, 60)) {
     console.warn(`[AUTHORIZE] Missing/expired Home token for ${userId}; forcing re-login`);
     res.clearCookie('userId');
-    return res.redirect(`/login?continue=${encodeURIComponent(`/authorize?${querystring.stringify(req.query)}`)}`);
+    return res.redirect(`/login?continue=${encodeURIComponent(continueTo)}`);
   }
 
   const code = uuidv4();
