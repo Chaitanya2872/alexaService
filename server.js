@@ -27,6 +27,7 @@ const homeApi = require('./utils/homeapi');
 const { jwtSecret, accessTokenTTL, homeApiBaseUrl } = require('./config/secrets');
 
 const app = express();
+app.set('trust proxy', 1);
 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -174,6 +175,22 @@ function recoverHomeTokenFromRefresh(userId) {
   return null;
 }
 
+function decodeJwtPayload(token) {
+  try {
+    const parts = String(token || '').split('.');
+    if (parts.length < 2) return null;
+    return JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function isJwtExpired(token, skewSec = 0) {
+  const payload = decodeJwtPayload(token);
+  if (!payload?.exp) return false;
+  return Math.floor(Date.now() / 1000) >= (payload.exp - skewSec);
+}
+
 loadOAuthStore();
 
 
@@ -287,7 +304,13 @@ app.post('/login', async (req, res) => {
     const acct = result.data;
     const token = result.token;
     storeHomeToken(acct.id, { homeApiToken: token, accountId: acct.id, projectId: acct.projectId || acct.activeProjectId, email: acct.email, name: acct.name });
-    res.cookie('userId', acct.id, { httpOnly: true, secure: false });
+    const isSecure = req.secure || req.headers['x-forwarded-proto'] === 'https' || process.env.NODE_ENV === 'production';
+    res.cookie('userId', acct.id, {
+      httpOnly: true,
+      secure: isSecure,
+      sameSite: 'lax',
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+    });
     res.redirect(cont || '/');
   } catch (err) {
     console.error(`[LOGIN] Failed: ${err.message}`);
@@ -317,7 +340,17 @@ app.get('/authorize', (req, res) => {
   }
 
   const userId = req.cookies.userId;
-  const stored = getHomeToken(userId);
+  let stored = getHomeToken(userId);
+  if (!stored?.homeApiToken) {
+    stored = recoverHomeTokenFromRefresh(userId);
+  }
+
+  if (!stored?.homeApiToken || isJwtExpired(stored.homeApiToken, 60)) {
+    console.warn(`[AUTHORIZE] Missing/expired Home token for ${userId}; forcing re-login`);
+    res.clearCookie('userId');
+    return res.redirect(`/login?continue=${encodeURIComponent(`/authorize?${querystring.stringify(req.query)}`)}`);
+  }
+
   const code = uuidv4();
   authCodes[code] = { clientId: client_id, redirectUri: redirect_uri, userId, scope, expiresAt: Date.now() + CODE_TTL_SEC * 1000,
     homeApiToken: stored?.homeApiToken, accountId: stored?.accountId, projectId: stored?.projectId };
@@ -337,12 +370,22 @@ app.post('/token', (req, res) => {
   } else { clientId = req.body.client_id; clientSecret = req.body.client_secret; }
 
   const client = clients[clientId];
-  if (!client || client.clientSecret !== clientSecret) return res.status(401).json({ error: 'invalid_client' });
+  if (!client || client.clientSecret !== clientSecret) {
+    console.error(`[TOKEN] invalid_client for client_id=${clientId || 'missing'}`);
+    return res.status(401).json({ error: 'invalid_client' });
+  }
 
   if (grant_type === 'authorization_code') {
     const stored = authCodes[req.body.code];
-    if (!stored || stored.clientId !== clientId) return res.status(400).json({ error: 'invalid_grant' });
-    if (Date.now() > stored.expiresAt) { delete authCodes[req.body.code]; return res.status(400).json({ error: 'invalid_grant' }); }
+    if (!stored || stored.clientId !== clientId) {
+      console.error(`[TOKEN] invalid_grant authorization_code: code missing/mismatch for client_id=${clientId}`);
+      return res.status(400).json({ error: 'invalid_grant' });
+    }
+    if (Date.now() > stored.expiresAt) {
+      delete authCodes[req.body.code];
+      console.error(`[TOKEN] invalid_grant authorization_code: code expired for user=${stored.userId}`);
+      return res.status(400).json({ error: 'invalid_grant' });
+    }
 
     const accessToken = jwt.sign({ sub: stored.userId, scope: stored.scope, client_id: clientId }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_TTL_SEC });
     const refreshToken = uuidv4();
@@ -364,9 +407,13 @@ app.post('/token', (req, res) => {
 
   if (grant_type === 'refresh_token') {
     const stored = refreshTokens[req.body.refresh_token];
-    if (!stored || stored.clientId !== clientId) return res.status(400).json({ error: 'invalid_grant' });
+    if (!stored || stored.clientId !== clientId) {
+      console.error(`[TOKEN] invalid_grant refresh_token: token missing/mismatch for client_id=${clientId}`);
+      return res.status(400).json({ error: 'invalid_grant' });
+    }
     if (Date.now() > stored.expiresAt) {
       removeRefreshToken(req.body.refresh_token);
+      console.error(`[TOKEN] invalid_grant refresh_token: token expired for user=${stored.userId}`);
       return res.status(400).json({ error: 'invalid_grant' });
     }
 
