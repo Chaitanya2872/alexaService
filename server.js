@@ -40,6 +40,7 @@ app.use((req, res, next) => {
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json());
 app.use(cookieParser());
+app.use('/assets', express.static(path.join(__dirname, 'assets')));
 
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = jwtSecret;
@@ -282,18 +283,310 @@ app.get('/login', (req, res) => {
   const continueTo = req.query.continue || '/';
   const error = req.query.error || '';
   res.send(`
-    <!DOCTYPE html><html><head><title>IOtiq Connect — Link Account</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#f0f4f8;display:flex;align-items:center;justify-content:center;min-height:100vh}.card{background:#fff;padding:2rem;border-radius:12px;box-shadow:0 4px 24px rgba(0,0,0,.1);width:100%;max-width:380px}h2{margin-bottom:.5rem;font-size:1.4rem}p{font-size:.9rem;color:#666;margin-bottom:1.5rem}label{display:block;font-size:.85rem;font-weight:600;color:#333;margin-bottom:.3rem}input{width:100%;padding:.65rem .9rem;border:1px solid #d1d5db;border-radius:8px;font-size:1rem;margin-bottom:1rem}button{width:100%;padding:.75rem;background:#2563eb;color:#fff;border:none;border-radius:8px;font-size:1rem;font-weight:600;cursor:pointer}.error{color:#dc2626;font-size:.85rem;margin-bottom:1rem;padding:.5rem;background:#fef2f2;border-radius:6px}</style>
-    </head><body><div class="card">
-    <h2>Link Your Account</h2><p>Sign in with IOtiq Connect to link with Alexa.</p>
-    ${error ? `<div class="error">${error}</div>` : ''}
-    <form method="POST" action="/login">
-      <input type="hidden" name="continue" value="${continueTo.replace(/"/g, '&quot;')}" />
-      <label>Email</label><input type="email" name="username" required />
-      <label>Password</label><input type="password" name="password" required />
-      <button type="submit">Sign In &amp; Link</button>
-    </form></div></body></html>
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>IOtiq Connect - Link Account</title>
+      <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        :root {
+          --bg: #f6f7fb;
+          --panel: #fff;
+          --text: #141925;
+          --muted: #6e7687;
+          --line: #dfe3ec;
+          --pill: #eef1f6;
+          --primary: #2f6bff;
+          --primary-dark: #2858d2;
+          --shadow: 0 10px 28px rgba(20, 33, 61, .08);
+        }
+        body {
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+          background: var(--bg);
+          color: var(--text);
+          min-height: 100vh;
+          display: flex;
+          justify-content: center;
+          padding: 22px 16px;
+        }
+        .shell { width: 100%; max-width: 380px; }
+        .top-controls { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+        .icon-btn {
+          width: 42px;
+          height: 42px;
+          border: 0;
+          border-radius: 50%;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          background: #eceff5;
+          color: #232833;
+          box-shadow: 0 6px 14px rgba(17, 24, 39, .08);
+          cursor: pointer;
+        }
+        .icon-btn svg { width: 18px; height: 18px; }
+        .card {
+          background: var(--panel);
+          border-radius: 24px;
+          padding: 20px 18px 18px;
+          box-shadow: var(--shadow);
+        }
+        .logo-wrap { text-align: center; margin-bottom: 14px; }
+        .logo-wrap img { height: 56px; width: auto; object-fit: contain; }
+        h2 { font-size: 1.75rem; font-weight: 700; letter-spacing: -.02em; text-align: center; margin-bottom: 4px; }
+        .subtitle { text-align: center; font-size: .94rem; color: var(--muted); margin-bottom: 16px; }
+        .error {
+          color: #d82424;
+          font-size: .86rem;
+          margin-bottom: 12px;
+          padding: 10px 12px;
+          background: #fff1f1;
+          border-radius: 12px;
+          border: 1px solid #ffd7d7;
+        }
+        .segment {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 6px;
+          padding: 5px;
+          background: var(--pill);
+          border-radius: 16px;
+          margin-bottom: 14px;
+        }
+        .segment-btn {
+          border: 0;
+          border-radius: 12px;
+          height: 38px;
+          font-size: .9rem;
+          font-weight: 600;
+          color: #242a36;
+          background: transparent;
+          cursor: pointer;
+        }
+        .segment-btn.active {
+          background: #2d313a;
+          color: #fff;
+          box-shadow: 0 5px 12px rgba(0, 0, 0, .16);
+        }
+        .field-label { display: block; margin-bottom: 6px; font-size: .82rem; color: #4f5665; font-weight: 600; }
+        .input {
+          width: 100%;
+          height: 54px;
+          border: 1px solid var(--line);
+          border-radius: 15px;
+          padding: 0 14px;
+          font-size: 1rem;
+          background: #fff;
+          margin-bottom: 12px;
+          outline: none;
+        }
+        .input:focus, .country-code:focus {
+          border-color: #8facff;
+          box-shadow: 0 0 0 3px rgba(47, 107, 255, .12);
+        }
+        .phone-row { display: grid; grid-template-columns: 92px 1fr; gap: 10px; margin-bottom: 12px; }
+        .country-code {
+          height: 54px;
+          border: 1px solid var(--line);
+          border-radius: 15px;
+          background: #fff;
+          padding: 0 10px;
+          font-size: .98rem;
+          outline: none;
+          appearance: none;
+          background-image: linear-gradient(45deg, transparent 50%, #4c5568 50%), linear-gradient(135deg, #4c5568 50%, transparent 50%);
+          background-position: calc(100% - 16px) calc(50% - 3px), calc(100% - 11px) calc(50% - 3px);
+          background-size: 5px 5px, 5px 5px;
+          background-repeat: no-repeat;
+        }
+        .primary-btn {
+          width: 100%;
+          height: 56px;
+          border: 0;
+          border-radius: 18px;
+          color: #fff;
+          font-size: 1rem;
+          font-weight: 700;
+          background: linear-gradient(180deg, var(--primary), var(--primary-dark));
+          box-shadow: 0 12px 22px rgba(47, 107, 255, .3);
+          cursor: pointer;
+          margin-top: 2px;
+        }
+        .divider {
+          margin: 18px 0 14px;
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          color: #7f8797;
+          font-size: .82rem;
+          justify-content: center;
+        }
+        .divider::before, .divider::after {
+          content: "";
+          height: 1px;
+          flex: 1;
+          max-width: 110px;
+          background: #dde2ea;
+        }
+        .social-stack { display: grid; gap: 10px; }
+        .social-btn {
+          width: 100%;
+          height: 54px;
+          border-radius: 16px;
+          border: 1px solid #dde2ea;
+          background: #fff;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          gap: 10px;
+          font-size: .95rem;
+          font-weight: 600;
+          color: #1f2633;
+          cursor: pointer;
+        }
+        .social-btn svg { width: 20px; height: 20px; }
+        .hidden { display: none; }
+      </style>
+    </head>
+    <body>
+      <div class="shell">
+        <div class="top-controls">
+          <button type="button" class="icon-btn" aria-label="Go Back" onclick="history.back()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+          </button>
+          <button type="button" class="icon-btn" id="infoBtn" aria-label="Info">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 10v6"/><path d="M12 7h.01"/></svg>
+          </button>
+        </div>
+
+        <div class="card">
+          <div class="logo-wrap">
+            <img src="/assets/iotiq-logo.png" alt="IOTIQ logo">
+          </div>
+          <h2>Welcome back!</h2>
+          <p class="subtitle">Sign in with your IOTIQ account to continue.</p>
+
+          ${error ? `<div class="error">${error}</div>` : ''}
+
+          <form id="loginForm" method="POST" action="/login">
+            <input type="hidden" name="continue" value="${continueTo.replace(/"/g, '&quot;')}" />
+            <input type="hidden" name="username" id="usernameHidden" />
+
+            <div class="segment" role="tablist" aria-label="Login Mode">
+              <button type="button" class="segment-btn active" id="tabPhone" role="tab" aria-selected="true">Phone Number</button>
+              <button type="button" class="segment-btn" id="tabEmail" role="tab" aria-selected="false">Email Address</button>
+            </div>
+
+            <div id="phoneFields">
+              <label class="field-label" for="phoneInput">Phone Number</label>
+              <div class="phone-row">
+                <select id="countryCode" class="country-code" aria-label="Country Code">
+                  <option value="+62" selected>+62</option>
+                  <option value="+91">+91</option>
+                  <option value="+1">+1</option>
+                  <option value="+44">+44</option>
+                </select>
+                <input id="phoneInput" class="input" type="tel" inputmode="numeric" autocomplete="tel" placeholder="812 3456 7890">
+              </div>
+            </div>
+
+            <div id="emailFields" class="hidden">
+              <label class="field-label" for="emailInput">Email Address</label>
+              <input id="emailInput" class="input" type="email" autocomplete="email" placeholder="you@example.com">
+            </div>
+
+            <label class="field-label" for="passwordInput">Password</label>
+            <input id="passwordInput" class="input" type="password" name="password" autocomplete="current-password" placeholder="Enter your password" required>
+
+            <button type="submit" class="primary-btn">Continue</button>
+          </form>
+
+          <div class="divider">or use social account</div>
+
+          <div class="social-stack">
+            <button type="button" class="social-btn" aria-label="Continue with Google">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#EA4335" d="M12 10.2v3.9h5.5c-.2 1.3-1.5 3.9-5.5 3.9-3.3 0-6-2.7-6-6s2.7-6 6-6c1.9 0 3.1.8 3.8 1.5l2.6-2.5C16.8 3.5 14.6 2.5 12 2.5 6.8 2.5 2.5 6.8 2.5 12s4.3 9.5 9.5 9.5c5.5 0 9.1-3.9 9.1-9.3 0-.6-.1-1.1-.2-1.5H12z"/></svg>
+              <span>Continue with Google</span>
+            </button>
+            <button type="button" class="social-btn" aria-label="Continue with Apple">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#111" d="M16.7 12.8c0-2.3 1.9-3.4 2-3.5-1.1-1.6-2.7-1.8-3.3-1.8-1.4-.1-2.7.8-3.4.8-.7 0-1.7-.8-2.8-.8-1.5 0-2.8.9-3.5 2.1-1.5 2.5-.4 6.3 1 8.3.7 1 1.5 2.2 2.6 2.2 1.1 0 1.5-.7 2.8-.7 1.3 0 1.7.7 2.8.7 1.2 0 1.9-1 2.6-2 .8-1.1 1.1-2.3 1.1-2.4 0 0-2-.8-2-3zM14.5 6.1c.6-.7 1-1.6.9-2.6-.9 0-1.9.6-2.5 1.3-.6.7-1.1 1.7-1 2.6 1 .1 2-.5 2.6-1.3z"/></svg>
+              <span>Continue with Apple</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <script>
+        (function () {
+          var mode = 'phone';
+          var form = document.getElementById('loginForm');
+          var usernameHidden = document.getElementById('usernameHidden');
+          var tabPhone = document.getElementById('tabPhone');
+          var tabEmail = document.getElementById('tabEmail');
+          var phoneFields = document.getElementById('phoneFields');
+          var emailFields = document.getElementById('emailFields');
+          var countryCode = document.getElementById('countryCode');
+          var phoneInput = document.getElementById('phoneInput');
+          var emailInput = document.getElementById('emailInput');
+          var passwordInput = document.getElementById('passwordInput');
+          var infoBtn = document.getElementById('infoBtn');
+
+          function setMode(nextMode) {
+            mode = nextMode;
+            var phoneActive = nextMode === 'phone';
+            tabPhone.classList.toggle('active', phoneActive);
+            tabEmail.classList.toggle('active', !phoneActive);
+            tabPhone.setAttribute('aria-selected', phoneActive ? 'true' : 'false');
+            tabEmail.setAttribute('aria-selected', phoneActive ? 'false' : 'true');
+            phoneFields.classList.toggle('hidden', !phoneActive);
+            emailFields.classList.toggle('hidden', phoneActive);
+          }
+
+          function compactPhone(raw) {
+            return String(raw || '').replace(/[^0-9]/g, '');
+          }
+
+          tabPhone.addEventListener('click', function () { setMode('phone'); });
+          tabEmail.addEventListener('click', function () { setMode('email'); });
+          infoBtn.addEventListener('click', function () {
+            window.alert('Sign in with your IOTIQ account to link with Alexa.');
+          });
+
+          form.addEventListener('submit', function (e) {
+            var username = '';
+            if (mode === 'phone') {
+              var dial = countryCode.value || '+62';
+              var phone = compactPhone(phoneInput.value);
+              if (!phone) {
+                e.preventDefault();
+                phoneInput.focus();
+                return;
+              }
+              username = dial + phone;
+            } else {
+              var email = String(emailInput.value || '').trim();
+              if (!email) {
+                e.preventDefault();
+                emailInput.focus();
+                return;
+              }
+              username = email;
+            }
+
+            if (!String(passwordInput.value || '').trim()) {
+              e.preventDefault();
+              passwordInput.focus();
+              return;
+            }
+
+            usernameHidden.value = username;
+          });
+        })();
+      </script>
+    </body>
+    </html>
   `);
 });
 
