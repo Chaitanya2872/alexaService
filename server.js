@@ -374,6 +374,7 @@ app.post('/token', (req, res) => {
     console.error(`[TOKEN] invalid_client for client_id=${clientId || 'missing'}`);
     return res.status(401).json({ error: 'invalid_client' });
   }
+  console.log(`[TOKEN] request grant_type=${grant_type} client_id=${clientId}`);
 
   if (grant_type === 'authorization_code') {
     const stored = authCodes[req.body.code];
@@ -401,6 +402,7 @@ app.post('/token', (req, res) => {
 
     if (stored.homeApiToken) storeHomeToken(stored.userId, { homeApiToken: stored.homeApiToken, accountId: stored.accountId, projectId: stored.projectId });
     delete authCodes[req.body.code];
+    console.log(`[TOKEN] authorization_code success user=${stored.userId}`);
 
     return res.json({ access_token: accessToken, token_type: 'Bearer', expires_in: ACCESS_TOKEN_TTL_SEC, refresh_token: refreshToken });
   }
@@ -419,6 +421,7 @@ app.post('/token', (req, res) => {
 
     const accessToken = jwt.sign({ sub: stored.userId, scope: stored.scope, client_id: clientId }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_TTL_SEC });
     if (stored.homeApiToken) storeHomeToken(stored.userId, { homeApiToken: stored.homeApiToken, accountId: stored.accountId, projectId: stored.projectId });
+    console.log(`[TOKEN] refresh_token success user=${stored.userId}`);
     return res.json({
       access_token: accessToken,
       token_type: 'Bearer',

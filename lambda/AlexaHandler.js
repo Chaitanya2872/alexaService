@@ -23,6 +23,20 @@ exports.handler = async (event) => {
   const namespace = event.directive.header.namespace;
   const name      = event.directive.header.name;
 
+  if (namespace === 'Alexa.Authorization' && name === 'AcceptGrant') {
+    return {
+      event: {
+        header: {
+          namespace:      'Alexa.Authorization',
+          name:           'AcceptGrant.Response',
+          payloadVersion: '3',
+          messageId:      generateMessageId(),
+        },
+        payload: {},
+      },
+    };
+  }
+
   if (namespace === 'Alexa.Discovery' && name === 'Discover') {
     return handleDiscovery(event);
   }
