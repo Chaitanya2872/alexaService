@@ -336,14 +336,16 @@ app.get('/authorize', (req, res) => {
     return res.status(400).send('Invalid redirect_uri');
   }
 
+  const forceLoginBypass = String(req.query._login_done || '') === '1';
   const continueTo = `/authorize?${querystring.stringify(req.query)}`;
-  const forceLogin = ALWAYS_SHOW_LOGIN || String(req.query.prompt || '').toLowerCase() === 'login';
+  const continueAfterForcedLogin = `/authorize?${querystring.stringify({ ...req.query, _login_done: '1' })}`;
+  const forceLogin = (ALWAYS_SHOW_LOGIN || String(req.query.prompt || '').toLowerCase() === 'login') && !forceLoginBypass;
   if (forceLogin) {
     if (req.cookies.userId) {
       console.log(`[AUTHORIZE] Force login enabled, clearing userId cookie`);
     }
     res.clearCookie('userId');
-    return res.redirect(`/login?continue=${encodeURIComponent(continueTo)}`);
+    return res.redirect(`/login?continue=${encodeURIComponent(continueAfterForcedLogin)}`);
   }
 
   if (!req.cookies.userId) {
