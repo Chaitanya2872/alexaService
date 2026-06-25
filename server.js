@@ -218,7 +218,8 @@ function getUserComponentMap(userId) {
 }
 
 function isAssignedComponent(comp) {
-  return Boolean(comp && !comp.isDeleted && comp.metadata && comp.metadata.type);
+  const deviceName = comp?.metadata?.deviceName?.trim();
+  return Boolean(comp && !comp.isDeleted && comp.metadata && comp.metadata.type && deviceName);
 }
 
 async function getCachedDevices(userId, homeApiToken, projectId) {
@@ -1055,28 +1056,8 @@ function buildAlexaEndpoints(data) {
       if (!isAssignedComponent(comp)) continue;
 
       const compType = (comp.metadata?.type || 'switch').toLowerCase();
-      const compDeviceName = comp.metadata?.deviceName || comp.name || '';
-
-      // Build a useful, unique friendly name
-      // Priority: room + deviceName > room + type + number > deviceName + number > type + number
-      let friendlyName;
-      const isGenericName = !compDeviceName || compDeviceName.toLowerCase() === 'switch' || compDeviceName.toLowerCase() === 'light';
-
-      if (!isGenericName && roomName) {
-        // Best case: "Kitchen CS Light"
-        friendlyName = `${roomName} ${compDeviceName}`;
-      } else if (!isGenericName) {
-        // No room but has unique name: "CS Light"
-        friendlyName = compDeviceName;
-      } else if (roomName) {
-        // Generic name with room: "Kitchen Light 1" or "Kitchen Switch 2"
-        const typeLabel = compType.charAt(0).toUpperCase() + compType.slice(1);
-        friendlyName = `${roomName} ${typeLabel} ${comp.componentNumber}`;
-      } else {
-        // No room, generic name: use parent device name + component number
-        const parentName = sw.Item?.name || sw.deviceName || 'Device';
-        friendlyName = `${parentName} ${compType} ${comp.componentNumber}`;
-      }
+      const compDeviceName = comp.metadata.deviceName.trim();
+      const friendlyName = roomName ? `${roomName} ${compDeviceName}` : compDeviceName;
 
       const alexaType = normalizeType(compType);
 
