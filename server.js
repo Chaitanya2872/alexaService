@@ -217,6 +217,10 @@ function getUserComponentMap(userId) {
   return componentMaps[userId];
 }
 
+function isAssignedComponent(comp) {
+  return Boolean(comp && !comp.isDeleted && comp.metadata && comp.metadata.type);
+}
+
 async function getCachedDevices(userId, homeApiToken, projectId) {
   const now = Date.now();
   const cached = deviceCache[userId];
@@ -266,9 +270,8 @@ function buildComponentMap(userId, data) {
     const isDongle = connectionType.includes('dongle') || itemName.includes('dongle') || itemCode.includes('dc');
 
     for (const comp of components) {
-      // Skip components with no metadata (unconfigured slots)
-      if (!comp.metadata) continue;
-      if (!comp.metadata.type) continue;
+      // Only include assigned/configured components, not every physical slot.
+      if (!isAssignedComponent(comp)) continue;
 
       componentMap[comp.id] = {
         parentSwitchId: parentId,
@@ -645,10 +648,11 @@ app.get('/authorize', (req, res) => {
     return res.status(400).send('Invalid redirect_uri');
   }
 
+  const isAlexaOAuthRequest = client_id === ALEXA_CLIENT_ID || isAlexaRedirectUri(redirect_uri);
   const forceLoginBypass = String(req.query._login_done || '') === '1';
   const continueTo = `/authorize?${querystring.stringify(req.query)}`;
   const continueAfterForcedLogin = `/authorize?${querystring.stringify({ ...req.query, _login_done: '1' })}`;
-  const forceLogin = (ALWAYS_SHOW_LOGIN || String(req.query.prompt || '').toLowerCase() === 'login') && !forceLoginBypass;
+  const forceLogin = (isAlexaOAuthRequest || ALWAYS_SHOW_LOGIN || String(req.query.prompt || '').toLowerCase() === 'login') && !forceLoginBypass;
   if (forceLogin) {
     if (req.cookies.userId) {
       console.log(`[AUTHORIZE] Force login enabled, clearing userId cookie`);
@@ -1048,9 +1052,7 @@ function buildAlexaEndpoints(data) {
     const floorName = sw.Segments?.[0]?.ParentSegment?.name || '';
 
     for (const comp of components) {
-      if (comp.isDeleted) continue;
-      if (!comp.metadata) continue; // Skip unconfigured component slots
-      if (!comp.metadata.type) continue; // Skip placeholders such as IR slots with no discoverable type
+      if (!isAssignedComponent(comp)) continue;
 
       const compType = (comp.metadata?.type || 'switch').toLowerCase();
       const compDeviceName = comp.metadata?.deviceName || comp.name || '';
