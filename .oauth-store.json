@@ -21,9 +21,11 @@
   },
   "homeTokenStore": {
     "d43d146b-10d4-4965-b5a9-44e1a6207977": {
-      "homeApiToken": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6ImQ0M2QxNDZiLTEwZDQtNDk2NS1iNWE5LTQ0ZTFhNjIwNzk3NyIsImlhdCI6MTc3MjEyOTkzMywiaXNzIjoiUFNNIiwiZXhwIjoxNzcyNzM0NzMzfQ.LJC01lxf7sZeVB1vyblTWkcaj6CcwEFBwQz2Y3oTyY8",
+      "homeApiToken": "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6ImQ0M2QxNDZiLTEwZDQtNDk2NS1iNWE5LTQ0ZTFhNjIwNzk3NyIsImlhdCI6MTc3MjE5NDg2MCwiaXNzIjoiUFNNIiwiZXhwIjoxNzcyNzk5NjYwfQ.Hrgo5gJBFIkOTji_GA8siTbRtCvM08aJWuuCCyQxL5M",
       "accountId": "d43d146b-10d4-4965-b5a9-44e1a6207977",
-      "projectId": "ff0d259f-c4f4-472d-845f-9ca416d6b919"
+      "projectId": "ff0d259f-c4f4-472d-845f-9ca416d6b919",
+      "email": "iotiqrnd@gmail.com",
+      "name": "Saravanakumar S"
     }
   }
 }

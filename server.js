@@ -205,7 +205,17 @@ const inflightRequests = {};
 
 // Maps componentId -> { parentSwitchId, switchNo, componentType, ... }
 // Built during discovery so control commands can look up the parent device
-const componentMap = {};
+const componentMaps = {};
+
+function clearObject(obj) {
+  for (const key of Object.keys(obj)) delete obj[key];
+}
+
+function getUserComponentMap(userId) {
+  if (!userId) return {};
+  if (!componentMaps[userId]) componentMaps[userId] = {};
+  return componentMaps[userId];
+}
 
 async function getCachedDevices(userId, homeApiToken, projectId) {
   const now = Date.now();
@@ -218,7 +228,7 @@ async function getCachedDevices(userId, homeApiToken, projectId) {
       deviceCache[userId] = { data: result, expiresAt: now + CACHE_TTL_MS };
       delete inflightRequests[userId];
       // Build component map
-      buildComponentMap(result.data);
+      buildComponentMap(userId, result.data);
       return result;
     })
     .catch((err) => { delete inflightRequests[userId]; throw err; });
@@ -226,14 +236,19 @@ async function getCachedDevices(userId, homeApiToken, projectId) {
   return inflightRequests[userId];
 }
 
-function invalidateCache(userId) { delete deviceCache[userId]; }
+function invalidateCache(userId) {
+  delete deviceCache[userId];
+  delete componentMaps[userId];
+}
 
 /**
  * Build a lookup from componentId -> parent switch info.
  * This is used during control to know which switch deviceId + switch_no to send.
  */
-function buildComponentMap(data) {
+function buildComponentMap(userId, data) {
   if (!data) return;
+  const componentMap = getUserComponentMap(userId);
+  clearObject(componentMap);
 
   // Iterate over BOTH switches AND devices (dongles)
   const allParentDevices = {
@@ -253,6 +268,7 @@ function buildComponentMap(data) {
     for (const comp of components) {
       // Skip components with no metadata (unconfigured slots)
       if (!comp.metadata) continue;
+      if (!comp.metadata.type) continue;
 
       componentMap[comp.id] = {
         parentSwitchId: parentId,
@@ -272,7 +288,7 @@ function buildComponentMap(data) {
     }
   }
 
-  console.log(`[componentMap] Built map for ${Object.keys(componentMap).length} components`);
+  console.log(`[componentMap] Built map for user ${userId}: ${Object.keys(componentMap).length} components`);
 }
 
 
@@ -788,10 +804,12 @@ app.post('/alexa/smart-home', async (req, res) => {
     if (!stored?.homeApiToken) return res.json(buildError('EXPIRED_AUTHORIZATION_CREDENTIAL', 'Not linked', correlationToken));
 
     const { homeApiToken, projectId } = stored;
+    let userComponentMap = getUserComponentMap(userId);
 
     // Ensure component map is populated
-    if (Object.keys(componentMap).length === 0) {
+    if (Object.keys(userComponentMap).length === 0) {
       await getCachedDevices(userId, homeApiToken, projectId);
+      userComponentMap = getUserComponentMap(userId);
     }
 
     // ── SceneController ─────────────────────────────────────────────────────
@@ -812,7 +830,7 @@ app.post('/alexa/smart-home', async (req, res) => {
     // ── PowerController ─────────────────────────────────────────────────────
     if (namespace === 'Alexa.PowerController') {
       const onOff = name === 'TurnOn' ? 'on' : 'off';
-      const comp = componentMap[endpointId];
+      const comp = userComponentMap[endpointId];
 
       if (comp) {
         // This is a component — use the correct utterance based on device type
@@ -843,7 +861,7 @@ app.post('/alexa/smart-home', async (req, res) => {
     // ── BrightnessController ────────────────────────────────────────────────
     if (namespace === 'Alexa.BrightnessController') {
       const brightness = request.directive.payload.brightness ?? request.directive.payload.brightnessDelta;
-      const comp = componentMap[endpointId];
+      const comp = userComponentMap[endpointId];
       const utterance = name === 'SetBrightness' ? `set brightness to ${brightness}%` : `adjust brightness by ${brightness}%`;
       console.log(`[ALEXA] Brightness: ${utterance} on ${endpointId}`);
 
@@ -867,7 +885,7 @@ app.post('/alexa/smart-home', async (req, res) => {
     // ── PowerLevelController (fans) ─────────────────────────────────────────
     if (namespace === 'Alexa.PowerLevelController') {
       const level = request.directive.payload.powerLevel ?? request.directive.payload.powerLevelDelta;
-      const comp = componentMap[endpointId];
+      const comp = userComponentMap[endpointId];
       console.log(`[ALEXA] PowerLevel: ${level} on ${endpointId}`);
 
       try {
@@ -890,7 +908,7 @@ app.post('/alexa/smart-home', async (req, res) => {
     // ── PercentageController ────────────────────────────────────────────────
     if (namespace === 'Alexa.PercentageController') {
       const pct = request.directive.payload.percentage ?? request.directive.payload.percentageDelta;
-      const comp = componentMap[endpointId];
+      const comp = userComponentMap[endpointId];
       console.log(`[ALEXA] Percentage: ${pct}% on ${endpointId}`);
 
       try {
@@ -970,7 +988,7 @@ app.post('/alexa/smart-home', async (req, res) => {
       let properties = [];
       try {
         const spacesData = await getCachedDevices(userId, homeApiToken, projectId);
-        properties = getComponentState(endpointId, spacesData.data);
+        properties = getComponentState(userId, endpointId, spacesData.data);
       } catch (err) { console.error(`[ALEXA] ReportState error: ${err.message}`); }
 
       properties.push({ namespace: 'Alexa.EndpointHealth', name: 'connectivity', value: { value: 'OK' }, timeOfSample: new Date().toISOString(), uncertaintyInMilliseconds: 200 });
@@ -998,7 +1016,23 @@ app.post('/alexa/smart-home', async (req, res) => {
 
 function buildAlexaEndpoints(data) {
   const endpoints = [];
+  const seenDiscoveryKeys = new Set();
   if (!data) return endpoints;
+
+  function addEndpoint(endpoint, discoveryKey) {
+    if (!discoveryKey || !endpoint?.endpointId) {
+      endpoints.push(endpoint);
+      return;
+    }
+
+    if (seenDiscoveryKeys.has(discoveryKey)) {
+      console.log(`[discovery] Skipping duplicate endpoint ${endpoint.endpointId} (${discoveryKey})`);
+      return;
+    }
+
+    seenDiscoveryKeys.add(discoveryKey);
+    endpoints.push(endpoint);
+  }
 
   // ── COMPONENTS are the real Alexa endpoints ─────────────────────────────
   // Iterate over BOTH switches (switch controllers) AND devices (dongles, IR blasters)
@@ -1016,6 +1050,7 @@ function buildAlexaEndpoints(data) {
     for (const comp of components) {
       if (comp.isDeleted) continue;
       if (!comp.metadata) continue; // Skip unconfigured component slots
+      if (!comp.metadata.type) continue; // Skip placeholders such as IR slots with no discoverable type
 
       const compType = (comp.metadata?.type || 'switch').toLowerCase();
       const compDeviceName = comp.metadata?.deviceName || comp.name || '';
@@ -1043,7 +1078,7 @@ function buildAlexaEndpoints(data) {
 
       const alexaType = normalizeType(compType);
 
-      endpoints.push({
+      addEndpoint({
         endpointId: comp.id,
         manufacturerName: 'IOtiq Connect',
         friendlyName,
@@ -1062,14 +1097,14 @@ function buildAlexaEndpoints(data) {
           { type: 'AlexaInterface', interface: 'Alexa.EndpointHealth', version: '3', properties: { supported: [{ name: 'connectivity' }], proactivelyReported: true, retrievable: true } },
           { type: 'AlexaInterface', interface: 'Alexa', version: '3' },
         ],
-      });
+      }, comp.id || `${parentId}:${comp.metadata?.switch_no || comp.componentNumber}`);
     }
   }
 
   // ── Scenes ──────────────────────────────────────────────────────────────
   const scenes = data.scenes || {};
   for (const [sceneId, scene] of Object.entries(scenes)) {
-    endpoints.push({
+    addEndpoint({
       endpointId: sceneId,
       manufacturerName: 'IOtiq Connect',
       friendlyName: scene.name || scene.displayName || `Scene ${sceneId.slice(0, 6)}`,
@@ -1080,7 +1115,7 @@ function buildAlexaEndpoints(data) {
         { type: 'AlexaInterface', interface: 'Alexa.SceneController', version: '3', supportsDeactivation: false, proactivelyReported: true },
         { type: 'AlexaInterface', interface: 'Alexa', version: '3' },
       ],
-    });
+    }, sceneId);
   }
 
   return endpoints;
@@ -1090,10 +1125,10 @@ function buildAlexaEndpoints(data) {
  * Get the current state of a component for ReportState.
  * Looks up the parent switch's deviceState for the component's switch_no.
  */
-function getComponentState(componentId, data) {
+function getComponentState(userId, componentId, data) {
   const properties = [];
   const now = new Date().toISOString();
-  const comp = componentMap[componentId];
+  const comp = getUserComponentMap(userId)[componentId];
 
   if (!comp) return properties;
 
