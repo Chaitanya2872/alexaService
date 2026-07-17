@@ -4,6 +4,42 @@ Local-only Node.js utility for listing and bulk deleting old Alexa Smart Home de
 
 This is not an official Amazon API. It drives the Alexa web UI with Playwright.
 
+## Alexa DeleteReport Support
+
+The Express server now includes a bulk Alexa `DeleteReport` helper for endpoints that were removed from your own device system.
+
+Set the event-gateway bearer in `.env` if you want the server to supply it automatically:
+
+```bash
+ALEXA_EVENT_GATEWAY_TOKEN=your-event-gateway-token
+```
+
+Call the route with a valid OAuth access token issued by this server in the `Authorization` header:
+
+```bash
+curl -X POST http://localhost:3000/alexa/delete-report \
+  -H "Authorization: Bearer <YOUR_SKILL_ACCESS_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "customerAccessToken": "<CUSTOMER_ACCESS_TOKEN>",
+    "endpointIds": ["device-001", "device-002", "device-003"]
+  }'
+```
+
+You can also pass `eventGatewayToken` in the JSON body instead of using `ALEXA_EVENT_GATEWAY_TOKEN`.
+
+If you want to select all currently discovered Alexa endpoints for the linked user, send:
+
+```bash
+curl -X POST http://localhost:3000/alexa/delete-report \
+  -H "Authorization: Bearer <YOUR_SKILL_ACCESS_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "customerAccessToken": "<CUSTOMER_ACCESS_TOKEN>",
+    "selectAll": true
+  }'
+```
+
 ## Safety
 
 - Default mode is `dry-run`.

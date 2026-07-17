@@ -24,6 +24,7 @@ const { v4: uuidv4 } = require('uuid');
 const querystring = require('querystring');
 
 const homeApi = require('./utils/homeapi');
+const { sendDeleteReport } = require('./utils/alexaEvents');
 const { jwtSecret, accessTokenTTL, homeApiBaseUrl } = require('./config/secrets');
 
 const app = express();
@@ -769,6 +770,76 @@ app.get('/userinfo', (req, res) => {
     const s = getHomeToken(p.sub);
     return res.json({ sub: p.sub, email: s?.email, name: s?.name });
   } catch { return res.status(401).json({ error: 'invalid_token' }); }
+});
+
+app.post('/alexa/delete-report', async (req, res) => {
+  const auth = req.headers.authorization;
+  if (!auth?.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'invalid_token' });
+  }
+
+  let authPayload;
+  try {
+    authPayload = jwt.verify(auth.slice(7), JWT_SECRET);
+  } catch {
+    return res.status(401).json({ error: 'invalid_token' });
+  }
+
+  const {
+    selectAll,
+    endpointIds,
+    endpoints,
+    customerAccessToken,
+    eventGatewayToken,
+    messageId,
+  } = req.body || {};
+
+  try {
+    let resolvedEndpointIds = endpointIds;
+    let resolvedEndpoints = endpoints;
+
+    if (selectAll) {
+      const userId = authPayload?.sub;
+      let stored = getHomeToken(userId);
+      if (!stored?.homeApiToken) {
+        stored = recoverHomeTokenFromRefresh(userId);
+      }
+      if (!stored?.homeApiToken) {
+        return res.status(400).json({
+          ok: false,
+          error: 'No linked Home API token found for selectAll.',
+        });
+      }
+
+      const spacesData = await getCachedDevices(userId, stored.homeApiToken, stored.projectId);
+      const discoveredEndpoints = buildAlexaEndpoints(spacesData.data);
+      resolvedEndpointIds = discoveredEndpoints.map((endpoint) => endpoint.endpointId).filter(Boolean);
+      resolvedEndpoints = [];
+    }
+
+    const result = await sendDeleteReport({
+      endpointIds: resolvedEndpointIds,
+      endpoints: resolvedEndpoints,
+      customerAccessToken,
+      eventGatewayToken: eventGatewayToken || process.env.ALEXA_EVENT_GATEWAY_TOKEN,
+      messageId,
+    });
+
+    console.log(`[ALEXA] DeleteReport sent for ${result.endpointCount} endpoints`);
+    return res.json({
+      ok: true,
+      endpointCount: result.endpointCount,
+      messageId: result.messageId,
+      status: result.status,
+    });
+  } catch (err) {
+    console.error(`[ALEXA] DeleteReport failed: ${err.message}`);
+    return res.status(err.status || 500).json({
+      ok: false,
+      error: err.message,
+      details: err.responseData || null,
+    });
+  }
 });
 
 
